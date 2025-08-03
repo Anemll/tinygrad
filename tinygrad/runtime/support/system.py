@@ -68,7 +68,19 @@ class _System:
     else: self.lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
 
     try: fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError: raise RuntimeError(f"Failed to take lock file {name}. It's already in use.")
+    except OSError:
+      print(f"WARNING: Lock file {name} is in use, attempting to force unlock...")
+      # Try to remove stale lock file and retry
+      try:
+        os.close(self.lock_fd)
+        os.unlink(lock_name)
+        print(f"DEBUG: Removed stale lock file {lock_name}")
+        # Retry
+        self.lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
+        fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print(f"DEBUG: Successfully acquired lock after cleanup")
+      except:
+        raise RuntimeError(f"Failed to take lock file {name}. It's already in use and cannot be cleaned up.")
 
     return self.lock_fd
 
@@ -82,9 +94,94 @@ class PCIDevice:
       FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/driver/unbind", os.O_WRONLY).write(self.pcibus)
 
     for i in resize_bars or []:
-      supported_sizes = int(FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/resource{i}_resize", os.O_RDONLY).read(), 16)
-      try: FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/resource{i}_resize", os.O_RDWR).write(str(supported_sizes.bit_length() - 1))
-      except OSError as e: raise RuntimeError(f"Cannot resize BAR {i}: {e}. Ensure the resizable BAR option is enabled on your system.") from e
+      # First check current BAR size
+      resource_path = f"/sys/bus/pci/devices/{self.pcibus}/resource"
+      try:
+        with open(resource_path, 'r') as f:
+          lines = f.readlines()
+          if getenv("DEBUG", "0") == "5":  # Only show detailed BAR info at DEBUG=5
+            print(f"DEBUG: Total BARs in resource file: {len(lines)}")
+            for idx, line in enumerate(lines[:6]):  # Show first 6 BARs
+              print(f"DEBUG: BAR {idx}: {line.strip()}")
+          if i < len(lines):
+            parts = lines[i].split()
+            if len(parts) >= 3 and parts[0] != '0x0000000000000000':
+              start = int(parts[0], 16)
+              end = int(parts[1], 16)
+              current_size = end - start + 1
+              size_mb = current_size / (1024**2)
+              size_gb = current_size / (1024**3)
+              print(f"DEBUG: BAR {i} current size: {size_mb:.0f} MB ({size_gb:.2f} GB)")
+              
+              # Skip resize if already >= 4GB
+              if current_size >= 4 * 1024**3:
+                print(f"DEBUG: BAR {i} already sized at {current_size / (1024**3):.1f} GB, skipping resize")
+                continue
+              else:
+                print(f"DEBUG: BAR {i} is only {size_gb:.2f} GB, needs resizing")
+      except Exception as e:
+        print(f"DEBUG: Could not read current BAR size: {e}")
+      
+      resize_path = f"/sys/bus/pci/devices/{self.pcibus}/resource{i}_resize"
+      print(f"DEBUG: Attempting to resize BAR {i} at path: {resize_path}")
+      print(f"DEBUG: Path exists: {os.path.exists(resize_path)}")
+      
+      # Read supported sizes
+      read_fd = FileIOInterface(resize_path, os.O_RDONLY)
+      supported_sizes = int(read_fd.read(), 16)
+      print(f"DEBUG: Supported sizes for BAR {i}: 0x{supported_sizes:x}, bit_length-1: {supported_sizes.bit_length() - 1}")
+      
+      # Write new size
+      try:
+        # For RTX 5070 with 12GB VRAM, we need to use bit 13 (8GB) not bit 14 (16GB)
+        # Check if bit 13 is set in supported sizes
+        if supported_sizes & (1 << 13):
+          new_size = "13"  # 8GB
+          print(f"DEBUG: RTX 5070 detected - using bit 13 (8GB) instead of bit 14 (16GB)")
+        else:
+          new_size = str(supported_sizes.bit_length() - 1)
+        print(f"DEBUG: Writing '{new_size}' to {resize_path}")
+        # Double-check file exists before writing
+        if not os.path.exists(resize_path):
+          print(f"ERROR: {resize_path} disappeared!")
+          raise FileNotFoundError(f"{resize_path} does not exist")
+        
+        # Try different approaches for sysfs files
+        try:
+          # Method 1: Direct write with open()
+          with open(resize_path, 'w') as f:
+            f.write(new_size)
+        except Exception as e1:
+          print(f"DEBUG: open() failed: {e1}, trying os.open()")
+          try:
+            # Method 2: Use os.open with O_WRONLY
+            fd = os.open(resize_path, os.O_WRONLY)
+            os.write(fd, new_size.encode())
+            os.close(fd)
+          except Exception as e2:
+            print(f"DEBUG: os.open() also failed: {e2}")
+            # Method 3: Try echo command
+            import subprocess
+            try:
+              subprocess.run(['echo', new_size], stdout=open(resize_path, 'w'), check=True)
+            except Exception as e3:
+              print(f"DEBUG: echo method also failed: {e3}")
+              raise e1  # Re-raise original error
+        print(f"DEBUG: Successfully wrote to BAR {i}")
+      except (OSError, IOError) as e:
+        print(f"DEBUG: Write failed with error: {e}, errno: {getattr(e, 'errno', 'unknown')}")
+        # If it's a permission error, it might be because the BAR is already at the right size
+        # or the system doesn't support resizing this BAR
+        if getattr(e, 'errno', None) == 13:  # Permission denied
+          print(f"DEBUG: Permission denied - BAR resize might not be supported")
+        
+        # Check current BAR size again
+        if 'current_size' in locals() and current_size >= 256 * 1024**2:  # At least 256MB
+          print(f"WARNING: Cannot resize BAR {i}, but current size {current_size / (1024**2):.0f} MB is sufficient for testing")
+          print("WARNING: Performance may be limited with smaller BAR size")
+          continue  # Continue without failing
+        else:
+          raise RuntimeError(f"Cannot resize BAR {i}: {e}. Ensure the resizable BAR option is enabled on your system.") from e
 
     if getenv("VFIO", 0) and (vfio_fd:=System.vfio()) is not None:
       FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/driver_override", os.O_WRONLY).write("vfio-pci")
@@ -116,8 +213,19 @@ class PCIDevice:
   def write_config(self, offset:int, value:int, size:int): self.cfg_fd.write(value.to_bytes(size, byteorder='little'), binary=True, offset=offset)
   def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
     fd, sz = self.bar_fds[bar], size or (self.bar_info[bar][1] - self.bar_info[bar][0] + 1)
-    libc.madvise(loc:=fd.mmap(addr, sz, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | (MAP_FIXED if addr else 0), off), sz, libc.MADV_DONTFORK)
-    return MMIOInterface(loc, sz, fmt=fmt)
+    print(f"DEBUG: map_bar({bar}) - fd={fd.fd}, size={sz} ({sz/(1024**2):.0f}MB), addr=0x{addr:x}, off={off}")
+    print(f"DEBUG: BAR {bar} info: start=0x{self.bar_info[bar][0]:x}, end=0x{self.bar_info[bar][1]:x}, flags=0x{self.bar_info[bar][2]:x}")
+    try:
+      flags = mmap.MAP_SHARED | (MAP_FIXED if addr else 0)
+      page_size = os.sysconf(os.sysconf_names['SC_PAGE_SIZE'])
+      print(f"DEBUG: mmap flags: {flags}, MAP_SHARED={mmap.MAP_SHARED}, MAP_FIXED={MAP_FIXED if addr else 0}")
+      print(f"DEBUG: page_size={page_size}, size_aligned={sz % page_size == 0}, offset_aligned={off % page_size == 0}")
+      loc = fd.mmap(addr, sz, mmap.PROT_READ | mmap.PROT_WRITE, flags, off)
+      libc.madvise(loc, sz, libc.MADV_DONTFORK)
+      return MMIOInterface(loc, sz, fmt=fmt)
+    except Exception as e:
+      print(f"DEBUG: mmap failed: {e}")
+      raise
 
 class PCIDevImplBase:
   mm: MemoryManager

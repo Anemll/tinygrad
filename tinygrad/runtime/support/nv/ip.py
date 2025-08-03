@@ -89,7 +89,7 @@ class NV_FLCN(NV_IP):
     self.prep_booter()
 
   def prep_ucode(self):
-    expansion_rom_off, bit_addr = {"GA": 0x16600, "AD": 0x14e00}[self.nvdev.chip_name[:2]], 0x1b0
+    expansion_rom_off, bit_addr = {"GA": 0x16600, "AD": 0x14e00, "GB": 0x14e00}[self.nvdev.chip_name[:2]], 0x1b0
     vbios_bytes = bytes(array.array('I', self.nvdev.mmio[0x00300000//4:(0x00300000+0x98e00)//4]))
 
     bit_header = nv.BIT_HEADER_V1_00.from_buffer_copy(vbios_bytes[bit_addr:bit_addr + ctypes.sizeof(nv.BIT_HEADER_V1_00)])

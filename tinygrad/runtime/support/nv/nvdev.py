@@ -74,6 +74,12 @@ class NVDev(PCIDevImplBase):
   def __init__(self, devfmt:str, mmio:MMIOInterface, vram:MMIOInterface, venid:int, subvenid:int, rev:int, bars:dict):
     self.devfmt, self.mmio, self.vram, self.venid, self.subvenid, self.rev, self.bars = devfmt, mmio, vram, venid, subvenid, rev, bars
     self.lock_fd = System.flock_acquire(f"nv_{self.devfmt}.lock")
+    
+    # Debug BAR sizes for firmware comparison
+    print(f"DEBUG: Available BARs for firmware loading:")
+    for bar_num, (start, end, flags) in bars.items():
+      size = end - start + 1
+      print(f"  BAR {bar_num}: {size} bytes ({size/(1024*1024):.1f} MB) at 0x{start:x}")
 
     self.smi_dev, self.is_booting = False, True
     self._early_init()
@@ -113,7 +119,12 @@ class NVDev(PCIDevImplBase):
     self.include("src/common/inc/swref/published/nv_ref.h")
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
     self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
-    self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
+    original_chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
+    self.chip_name = original_chip_name
+    if self.chip_name == "GB205": 
+      print(f"DEBUG: RTX 5070 detected - mapping chip {original_chip_name} → GB202 for compatibility")
+      self.chip_name = "GB202" # for testing
+    print(f"DEBUG: Using chip name: {self.chip_name} (original: {original_chip_name})")
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
 
     self.include("src/common/inc/swref/published/turing/tu102/dev_fb.h")
@@ -141,6 +152,9 @@ class NVDev(PCIDevImplBase):
 
   def _download(self, file:str) -> str:
     url = f"https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/{file}"
+    chip_name = getattr(self, 'chip_name', 'unknown')
+    print(f"DEBUG: Downloading {file} using chip_name={chip_name}")
+    print(f"DEBUG: URL: {url}")
     return fetch(url, subdir="defines").read_text()
 
   def extract_fw(self, file:str, dname:str) -> bytes:
@@ -149,7 +163,9 @@ class NVDev(PCIDevImplBase):
     text = self._download(f"src/nvidia/generated/g_bindata_{tname}_{self.chip_name}.c")
     info, sl = text[text[:text.index(dnm:=f'{file}_{self.chip_name}_{dname}')].rindex("COMPRESSION:"):][:16], text[text.index(dnm) + len(dnm) + 7:]
     image = bytes.fromhex(sl[:sl.find("};")].strip().replace("0x", "").replace(",", "").replace(" ", "").replace("\n", ""))
-    return gzip.decompress(struct.pack("<4BL2B", 0x1f, 0x8b, 8, 0, 0, 0, 3) + image) if "COMPRESSION: YES" in info else image
+    fw_data = gzip.decompress(struct.pack("<4BL2B", 0x1f, 0x8b, 8, 0, 0, 0, 3) + image) if "COMPRESSION: YES" in info else image
+    print(f"DEBUG: Extracted firmware {file}:{dname} - size: {len(fw_data)} bytes ({len(fw_data)/(1024*1024):.1f} MB)")
+    return fw_data
 
   def include(self, file:str):
     regs_off = {'NV_PFALCON_FALCON': 0x0, 'NV_PGSP_FALCON': 0x0, 'NV_PSEC_FALCON': 0x0, 'NV_PRISCV_RISCV': 0x1000, 'NV_PGC6_AON': 0x0, 'NV_PFSP': 0x0,

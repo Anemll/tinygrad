@@ -25,8 +25,13 @@ class FileIOInterface:
   def __init__(self, path:str="", flags:int=os.O_RDONLY, fd:int|None=None):
     self.path:str = path
     self.fd:int = fd or os.open(path, flags)
+    if getenv("DEBUG", "0") == "3":
+      print(f"DEBUG: FileIOInterface opened {path} with flags={flags:x}, fd={self.fd}")
   def __del__(self):
-    if hasattr(self, 'fd'): os.close(self.fd)
+    if hasattr(self, 'fd'):
+      if getenv("DEBUG", "0") == "3":
+        print(f"DEBUG: FileIOInterface closing fd={self.fd} for path={getattr(self, 'path', 'unknown')}")
+      os.close(self.fd)
   def ioctl(self, request, arg): return fcntl.ioctl(self.fd, request, arg)
   def mmap(self, start, sz, prot, flags, offset):
     x = libc.mmap(start, sz, prot, flags, self.fd, offset)
@@ -34,10 +39,15 @@ class FileIOInterface:
     return x
   def read(self, size=None, binary=False, offset=None):
     if offset is not None: self.seek(offset)
-    with open(self.fd, "rb" if binary else "r", closefd=False) as file: return file.read(size)
+    with os.fdopen(self.fd, "rb" if binary else "r", closefd=False) as file: return file.read(size)
   def write(self, content, binary=False, offset=None):
     if offset is not None: self.seek(offset)
-    with open(self.fd, "wb" if binary else "w", closefd=False) as file: file.write(content)
+    if isinstance(content, str): content = content.encode()
+    try:
+      os.write(self.fd, content)
+    except OSError as e:
+      print(f"DEBUG: os.write failed - fd={self.fd}, content={content}, error={e}")
+      raise
   def listdir(self): return os.listdir(self.path)
   def seek(self, offset): os.lseek(self.fd, offset, os.SEEK_SET)
   @staticmethod

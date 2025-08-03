@@ -10,7 +10,18 @@ import ctypes, ctypes.util
 
 
 _libraries = {}
-_libraries['libnvrtc.so'] = ctypes.CDLL(ctypes.util.find_library('nvrtc'))
+nvrtc_lib_path = ctypes.util.find_library('nvrtc')
+if nvrtc_lib_path:
+    _libraries['libnvrtc.so'] = ctypes.CDLL(nvrtc_lib_path)
+else:
+    print("WARNING: NVRTC library not found, using mock library")
+    # Create a mock library that raises NotImplementedError
+    class MockNVRTC:
+        def __getattr__(self, name):
+            def mock_func(*args, **kwargs):
+                raise NotImplementedError(f"NVRTC function {name} not available - NVRTC library not installed")
+            return mock_func
+    _libraries['libnvrtc.so'] = MockNVRTC()
 def string_cast(char_pointer, encoding='utf-8', errors='strict'):
     value = ctypes.cast(char_pointer, ctypes.c_char_p).value
     if value is not None and encoding is not None:
