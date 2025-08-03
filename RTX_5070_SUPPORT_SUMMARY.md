@@ -31,6 +31,9 @@ export NV=1
 # Force device selection
 export DEV=NV
 
+# Force driverless PCI interface (no NVIDIA kernel drivers required)
+export NV_IFACE=PCI
+
 # Enable debugging
 export DEBUG=2          # General debug level
 export NV_DEBUG=2       # NVIDIA-specific debug
@@ -92,9 +95,14 @@ python3 demo_rtx_5070.py
 # Activate virtual environment
 source venv-tiny-anemll/bin/activate
 
-# Run with root permissions for full GPU access
+# Run with root permissions for full GPU access (driverless mode)
 sudo python3 demo_rtx_5070_sudo.py
 ```
+
+### Important Notes
+- **Driverless Operation**: The demos automatically set `NV_IFACE=PCI` to use direct PCI access without NVIDIA kernel drivers
+- **Root Access**: Required for PCI BAR resizing to access GPU memory
+- **No Driver Installation**: Works without `/dev/nvidia*` device files
 
 ### Manual Testing
 ```python
@@ -118,7 +126,7 @@ print(f"GPU result: {result}")
 ### Current Limitations
 - **PCI Access**: Requires root permissions for BAR resizing
 - **Memory Management**: GPU memory allocation requires proper setup
-- **Driver Compatibility**: Depends on NVIDIA driver support
+- **Driverless Mode**: Must set `NV_IFACE=PCI` to bypass kernel driver requirements
 
 ## 🔧 Technical Details
 

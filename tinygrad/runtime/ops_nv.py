@@ -226,6 +226,10 @@ class NVProgram(HCQProgram):
 
     ctypes.memmove(self.lib_gpu.va_addr, mv_address(image), image.nbytes)
 
+    # Blackwell GPUs need a larger constant buffer (at least 224 elements for index 223)
+    if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A:
+      cbuf0_size = max(cbuf0_size, 224 * 4)  # Ensure at least 896 bytes
+    
     self.constbuffer_0 = [0] * (cbuf0_size // 4)
 
     if dev.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A:
@@ -522,7 +526,12 @@ class NVDevice(HCQCompiled[HCQSignal]):
       'num_tpc_per_gpc', 'num_sm_per_tpc', 'max_warps_per_sm', 'sm_version')
 
     # FIXME: no idea how to convert this for blackwells
-    self.arch: str = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
+    # RTX 5070 (Blackwell GB202) uses sm_version 0xa04 but NVRTC doesn't support sm_120 yet
+    # Map Blackwell GPUs to sm_90 for NVRTC compatibility
+    if self.sm_version == 0xa04:  # Blackwell GB202 (RTX 5070)
+        self.arch = "sm_90"  # Use Ada Lovelace arch for NVRTC compatibility
+    else:
+        self.arch = f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
     self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
 
     compiler_t = (PTXCompiler if PTX else CUDACompiler) if MOCKGPU else (NVPTXCompiler if PTX else NVCompiler)
