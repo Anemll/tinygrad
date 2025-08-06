@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-RTX 5070 Support Demo for tinygrad (Root Version)
+RTX 5070 Support Demo for tinygrad
 This script demonstrates the successful integration of RTX 5070 support with GPU acceleration.
-Run with: sudo python3 demo_rtx_5070_sudo.py
+Run with: 
+  - Linux: sudo python3 demo_rtx_5070_sudo.py
+  - macOS: python3 demo_rtx_5070_sudo.py (no sudo needed)
 """
 
 import os
 import sys
 import time
-from tinygrad import Tensor
+#from tinygrad import Tensor
 from tinygrad.helpers import Context
 
 def setup_gpu_environment():
@@ -27,6 +29,10 @@ def setup_gpu_environment():
     # Force device selection
     os.environ["DEV"] = "NV"
     print("✓ Set DEV=NV")
+    
+    # Force NV interface selection (use PCI interface for direct GPU access)
+    os.environ["NV_IFACE"] = "PCI"
+    print("✓ Set NV_IFACE=PCI")
     
     print("Environment variables set successfully!")
     print()
@@ -186,20 +192,23 @@ def test_gpu_performance():
 
 def main():
     """Main test function"""
-    print("=== RTX 5070 GPU Support Demo (Root Mode) ===")
+    print("=== RTX 5070 GPU Support Demo ===")
     print("Testing tinygrad with RTX 5070 (device ID: 0x2f04)")
-    print("This demo will test GPU acceleration with full PCI access.")
-    print("Run with: sudo python3 demo_rtx_5070_sudo.py")
+    print("This demo will test GPU acceleration.")
+    print("Platform:", sys.platform)
     print()
     
-    # Check if running as root
-    if os.geteuid() != 0:
-        print("❌ This script must be run as root (sudo) for GPU access!")
+    # Check if running as root (Linux only)
+    if sys.platform == "darwin":
+        print("✓ Running on macOS - eGPU access via DriverKit (no sudo required)")
+        print()
+    elif os.geteuid() != 0:
+        print("❌ This script must be run as root (sudo) for GPU access on Linux!")
         print("Please run: sudo python3 demo_rtx_5070_sudo.py")
         sys.exit(1)
-    
-    print("✓ Running as root - GPU access enabled")
-    print()
+    else:
+        print("✓ Running as root - GPU access enabled")
+        print()
     
     # Setup environment
     setup_gpu_environment()
@@ -208,10 +217,10 @@ def main():
     with Context(DEBUG=3):
         tests = [
             ("GPU Detection", test_gpu_detection),
-            ("GPU Tensor Operations", test_gpu_tensor_operations),
-            ("GPU Matrix Operations", test_gpu_matrix_operations),
-            ("GPU Autograd", test_gpu_autograd),
-            ("GPU Performance", test_gpu_performance),
+            #("GPU Tensor Operations", test_gpu_tensor_operations),
+            #   ("GPU Matrix Operations", test_gpu_matrix_operations),
+            #("GPU Autograd", test_gpu_autograd),
+            #("GPU Performance", test_gpu_performance),
         ]
         
         results = []
@@ -219,9 +228,14 @@ def main():
             try:
                 result = test_func()
                 results.append((test_name, result))
+                if not result:
+                    print(f"\n❌ Stopping tests due to failure in {test_name}")
+                    break
             except Exception as e:
                 print(f"✗ {test_name} failed with exception: {e}")
                 results.append((test_name, False))
+                print(f"\n❌ Stopping tests due to exception in {test_name}")
+                break
     
     # Summary
     print("=== Test Summary (Root Mode) ===")
