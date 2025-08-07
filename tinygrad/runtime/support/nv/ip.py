@@ -326,7 +326,8 @@ class NV_GSP(NV_IP):
     # Alloc queues
     pte_cnt = ((queue_pte_cnt:=(queue_size * 2) // 0x1000)) + round_up(queue_pte_cnt * 8, 0x1000) // 0x1000
     pt_size = round_up(pte_cnt * 8, 0x1000)
-    queues_va, queues_sysmem = System.alloc_sysmem(pt_size + queue_size * 2, contiguous=False)
+    queues_va, queues_sysmem = System.alloc_sysmem(pt_size + queue_size * 2, contiguous=False, 
+                                                   direction=System.DMA_DIRECTION_BIDIRECTIONAL)
 
     # Fill up ptes
     for i, sysmem in enumerate(queues_sysmem): to_mv(queues_va + i * 0x8, 0x8).cast('Q')[0] = sysmem
@@ -346,7 +347,8 @@ class NV_GSP(NV_IP):
     self.cmd_q = NVRpcQueue(self, self.cmd_q_va, None)
 
   def init_libos_args(self):
-    _, logbuf_sysmem = System.alloc_sysmem((2 << 20), contiguous=True)
+    _, logbuf_sysmem = System.alloc_sysmem((2 << 20), contiguous=True,
+                                           direction=System.DMA_DIRECTION_GPU_TO_CPU)
     libos_args_va, self.libos_args_sysmem = System.alloc_sysmem(0x1000, contiguous=True)
 
     libos_structs = (nv.LibosMemoryRegionInitArgument * 6).from_address(libos_args_va)
@@ -521,9 +523,45 @@ class NV_GSP(NV_IP):
     self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_SET_PAGE_DIRECTORY)
 
   def rpc_set_gsp_system_info(self):
-    def bdf_as_int(s): return (int(s[5:7],16)<<8) | (int(s[8:10],16)<<3) | int(s[-1],16)
+    def bdf_as_int(s): 
+      if s.startswith('egpu'):
+        # eGPU format: "egpu0" -> return device ID (0 for first eGPU)
+        return int(s[4:]) if len(s) > 4 and s[4:].isdigit() else 0
+      else:
+        # PCI format: "0000:01:00.0" -> parse bus:device.function
+        return (int(s[5:7],16)<<8) | (int(s[8:10],16)<<3) | int(s[-1],16)
 
-    data = nv.GspSystemInfo(gpuPhysAddr=self.nvdev.bars[0][0], gpuPhysFbAddr=self.nvdev.bars[1][0], gpuPhysInstAddr=self.nvdev.bars[3][0],
+    from tinygrad.runtime.support.system import OSX
+    
+    # Debug: Print available BAR keys
+    print(f"🔍 Available nvdev.bars keys: {list(self.nvdev.bars.keys())}")
+    print(f"🔍 nvdev.bars content: {self.nvdev.bars}")
+    
+    if OSX:
+      # macOS eGPU: Use DriverKit detected BARs
+      # Expected: BAR0=control, BAR2=VRAM, BAR4=instruction memory
+      available_bars = list(self.nvdev.bars.keys())
+      print(f"🔍 Available BARs on macOS: {available_bars}")
+      
+      # Map BARs based on DriverKit detection
+      gpuPhysAddr = self.nvdev.bars.get(0, (0, 0))[0]    # BAR 0 - Control/registers
+      gpuPhysFbAddr = self.nvdev.bars.get(2, (0, 0))[0]  # BAR 2 - VRAM/frame buffer  
+      gpuPhysInstAddr = self.nvdev.bars.get(4, gpuPhysFbAddr)[0] if 4 in self.nvdev.bars else gpuPhysFbAddr  # BAR 4 - Instruction memory, fallback to BAR 2
+      
+      print(f"🔍 macOS eGPU BAR mapping: GPU=0x{gpuPhysAddr:x}, FB=0x{gpuPhysFbAddr:x}, Inst=0x{gpuPhysInstAddr:x}")
+      
+      # Validate we have the essential BARs
+      if gpuPhysAddr == 0:
+        raise RuntimeError("❌ BAR 0 (control registers) not available")
+      if gpuPhysFbAddr == 0:
+        raise RuntimeError("❌ BAR 2 (VRAM) not available")
+    else:
+      # Linux BAR mapping: 0, 1, 3
+      gpuPhysAddr = self.nvdev.bars[0][0]      # BAR 0 - GPU memory
+      gpuPhysFbAddr = self.nvdev.bars[1][0]    # BAR 1 - Frame buffer
+      gpuPhysInstAddr = self.nvdev.bars[3][0]  # BAR 3 - Instruction memory
+
+    data = nv.GspSystemInfo(gpuPhysAddr=gpuPhysAddr, gpuPhysFbAddr=gpuPhysFbAddr, gpuPhysInstAddr=gpuPhysInstAddr,
       pciConfigMirrorBase=[0x88000, 0x92000][self.nvdev.fmc_boot], pciConfigMirrorSize=0x1000, nvDomainBusDeviceFunc=bdf_as_int(self.nvdev.devfmt),
       bIsPassthru=1, PCIDeviceID=self.nvdev.venid, PCISubDeviceID=self.nvdev.subvenid, PCIRevisionID=self.nvdev.rev, maxUserVa=0x7ffffffff000)
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, bytes(data))
