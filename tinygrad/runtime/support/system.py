@@ -404,7 +404,10 @@ class PCIDevice:
     if OSX:
       # For macOS, pcibus is just the device index
       self.device_id = int(pcibus) if pcibus.isdigit() else 0
-      self.egpu_device = None  # Will be initialized on first use
+      self.egpu_device = None  # Deprecated: replaced by macos_egpu provider
+      # Acquire macOS eGPU provider device to populate BAR info with real bases
+      from tinygrad.runtime.support.nv.macos_egpu import acquire_device
+      mac_dev = acquire_device(self.device_id)
       
       # BAR mapping for different platforms
       # Linux uses traditional PCI enumeration:
@@ -427,18 +430,24 @@ class PCIDevice:
       
       # Create mapping from Linux BAR indices to platform-specific indices
       self._bar_remap = {0: self.BAR_MMIO, 1: self.BAR_VRAM, 3: self.BAR_INST}
-      
-      # Create dummy bar_info for compatibility
+
+      # Build bar_info with actual physical base addresses expected by ip.py (0,2,4)
       self.bar_info = {}
-      for bar in bars:
-        if bar == 0:  # MMIO registers
-          self.bar_info[bar] = (0x0, 0x1000000, 0)  # 16MB MMIO space
-        elif bar == 1:  # VRAM (Linux BAR1 -> macOS BAR2)
-          self.bar_info[bar] = (0x0, 0x300000000, 0)  # 12GB for RTX 5070
-        elif bar == 3:  # Instruction memory (Linux BAR3 -> macOS BAR4)
-          self.bar_info[bar] = (0x0, 0x2000000, 0)  # 32MB instruction memory
-        else:
-          self.bar_info[bar] = (0x0, 0x0, 0)  # Empty BAR
+      def _put(idx_linux:int, idx_mac:int):
+        base = int(mac_dev.info.bar_bases[idx_mac])
+        size = int(mac_dev.info.bar_sizes[idx_mac])
+        if size > 0:
+          self.bar_info[idx_linux] = (base, base + size - 1, 0)
+      _put(0, 0)  # BAR0 regs
+      _put(1, 2)  # Linux BAR1 maps to macOS BAR2 (VRAM)
+      _put(3, 4)  # Linux BAR3 maps to macOS BAR4 (INST)
+
+      # Also expose keys 2 and 4 for ip.py OSX expectations (GPU FB and Inst)
+      # ip.py uses bars.get(2) and bars.get(4) on OSX
+      if int(mac_dev.info.bar_sizes[2]) > 0:
+        self.bar_info[2] = (int(mac_dev.info.bar_bases[2]), int(mac_dev.info.bar_bases[2]) + int(mac_dev.info.bar_sizes[2]) - 1, 0)
+      if int(mac_dev.info.bar_sizes[4]) > 0:
+        self.bar_info[4] = (int(mac_dev.info.bar_bases[4]), int(mac_dev.info.bar_bases[4]) + int(mac_dev.info.bar_sizes[4]) - 1, 0)
       
       # Create dummy file descriptors for compatibility
       self.cfg_fd = None
