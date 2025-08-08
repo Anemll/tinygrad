@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes, time, array, struct, itertools, dataclasses
 from typing import cast, Any
 from tinygrad.runtime.autogen.nv import nv
-from tinygrad.helpers import to_mv, lo32, hi32, DEBUG, round_up, round_down, mv_address, fetch, wait_cond
+from tinygrad.helpers import to_mv, lo32, hi32, DEBUG, round_up, round_down, mv_address, fetch, wait_cond, getenv
 from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.autogen import nv_gpu
@@ -21,17 +21,21 @@ class NVRpcQueue:
     if DEBUG >= 1:
       print(f"NVRpcQueue.__init__: initialize RPC queue (va=0x{va:x}); wait for TX header entryOff==0x1000")
     self.tx = nv.msgqTxHeader.from_address(va)
-    if True:
+    skip_wait = bool(getenv("NV_SKIP_RPC_INIT_WAIT", 0))
+    if not skip_wait:
       wait_cond(lambda: self.tx.entryOff, value=0x1000, msg="[NVRpcQueue.__init__] RPC queue not initialized", debug_wait=2)
     else:
-      for i in range(10):
-        print(f"FSP Read-before-write-0: {self.tx.entryOff}")
-        time.sleep(0.1)
+      if DEBUG >= 1:
+        print(f"NVRpcQueue.__init__: SKIP WAIT enabled (NV_SKIP_RPC_INIT_WAIT=1). entryOff={self.tx.entryOff}")
 
     if completion_q_va is not None: self.rx = nv.msgqRxHeader.from_address(completion_q_va + nv.msgqTxHeader.from_address(completion_q_va).rxHdrOff)
 
-    self.gsp, self.va, self.queue_va, self.seq = gsp, va, va + self.tx.entryOff, 0
-    self.queue_mv = to_mv(self.queue_va, self.tx.msgSize * self.tx.msgCount)
+    # Compute queue view; be tolerant if header not yet initialized
+    entry_off = self.tx.entryOff if self.tx.entryOff != 0 else 0x1000 if skip_wait else self.tx.entryOff
+    msg_size = self.tx.msgSize if self.tx.msgSize != 0 else 0x1000 if skip_wait else self.tx.msgSize
+    msg_count = self.tx.msgCount if self.tx.msgCount != 0 else ((getattr(gsp, 'queue_size', 0) - 0x1000)//0x1000 if skip_wait else self.tx.msgCount)
+    self.gsp, self.va, self.queue_va, self.seq = gsp, va, va + entry_off, 0
+    self.queue_mv = to_mv(self.queue_va, max(0, msg_size * msg_count))
     if DEBUG >= 1:
       print(f"NVRpcQueue.__init__: TX ready (msgSize=0x{self.tx.msgSize:x}, msgCount={self.tx.msgCount}), queue_va=0x{self.queue_va:x}")
 
