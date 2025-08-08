@@ -402,8 +402,9 @@ class PCIDevice:
     
     # macOS eGPU support
     if OSX:
-      # For macOS, pcibus is just the device index
+      # For macOS, pcibus is just the device index; normalize to 'egpuX' for downstream consumers
       self.device_id = int(pcibus) if pcibus.isdigit() else 0
+      self.pcibus = f"egpu{self.device_id}"
       self.egpu_device = None  # Deprecated: replaced by macos_egpu provider
       # Acquire macOS eGPU provider device to populate BAR info with real bases
       from tinygrad.runtime.support.nv.macos_egpu import acquire_device
