@@ -69,34 +69,93 @@ if libegpu is not None:
   libegpu.egpu_device_copy_dma_buffers.argtypes = [c_void_p, c_uint64, c_uint64, c_uint64, c_uint64]
 
 class EGPUMMIOInterface(MMIOInterface):
-  def __init__(self, device_handle: c_void_p, bar_index: int, fmt: str = 'I'):
+  def __init__(self, device_handle: c_void_p, bar_index: int, fmt: str = 'I', base_offset: int = 0, size_bytes: int | None = None):
     if libegpu is None: raise RuntimeError("libegpu_pcidevice.dylib not available")
     self._fmt = fmt
     self._if = libegpu.egpu_device_map_bar(device_handle, c_int(bar_index))
     if not self._if: raise RuntimeError(f"Failed to map BAR{bar_index}")
     self._elt = struct.calcsize(fmt)
-    self._size_bytes = 64 * 1024 * 1024
-    if DEBUG >= 2: print(f"macos_egpu: mapped BAR{bar_index} -> iface=0x{int(self._if):x}")
+    self._base = base_offset
+    self._size_bytes = size_bytes or (64 * 1024 * 1024)
+    if DEBUG >= 2: print(f"macos_egpu: mapped BAR{bar_index} -> iface=0x{int(self._if):x}, base={self._base}, fmt={self._fmt}")
 
   def __len__(self):
     return self._size_bytes // self._elt
 
-  def __getitem__(self, idx: int):
-    off = idx * self._elt
+  def __getitem__(self, idx):
+    if isinstance(idx, slice):
+      start, stop, step = idx.indices(len(self))
+      if step != 1: raise NotImplementedError("Step slicing not supported")
+      length = stop - start
+      if self._fmt == 'B':
+        # Byte-granular read
+        return bytes(int(libegpu.egpu_mmio_read8(self._if, c_uint64(self._base + start + off))) for off in range(length))
+      elif self._fmt == 'I':
+        # 32-bit reads, return list of uint32
+        words = length // 4
+        return [int(libegpu.egpu_mmio_read32(self._if, c_uint64(self._base + (start//4 + i) * 4))) for i in range(words)]
+      else:
+        raise NotImplementedError(self._fmt)
+    # Single element
+    off = self._base + idx * self._elt
     if self._fmt == 'I': return int(libegpu.egpu_mmio_read32(self._if, c_uint64(off)))
     if self._fmt == 'B': return int(libegpu.egpu_mmio_read8(self._if, c_uint64(off)))
     raise NotImplementedError(self._fmt)
 
-  def __setitem__(self, idx: int, val: int):
-    off = idx * self._elt
+  def __setitem__(self, idx, val):
+    if isinstance(idx, slice):
+      start, stop, step = idx.indices(len(self))
+      if step != 1: raise NotImplementedError("Step slicing not supported")
+      length = stop - start
+      # Support bytes/bytearray for 'B' format
+      if self._fmt == 'B':
+        if isinstance(val, (bytes, bytearray)):
+          for i in range(length):
+            b = val[i] if i < len(val) else 0
+            libegpu.egpu_mmio_write8(self._if, c_uint64(self._base + start + i), c_uint32(b))
+        else:
+          # Assume iterable of ints
+          for i, v in enumerate(val):
+            if i >= length: break
+            libegpu.egpu_mmio_write8(self._if, c_uint64(self._base + start + i), c_uint32(int(v) & 0xff))
+        libegpu.egpu_mmio_memory_barrier(self._if)
+        return
+      elif self._fmt == 'I':
+        # Expect iterable of uint32 or bytes length multiple of 4
+        if isinstance(val, (bytes, bytearray)):
+          for i in range(0, length, 4):
+            chunk = val[i:i+4]
+            if len(chunk) < 4: chunk = chunk + b"\x00"*(4-len(chunk))
+            word = int.from_bytes(chunk, 'little')
+            libegpu.egpu_mmio_write32(self._if, c_uint64(self._base + start + i), c_uint32(word))
+        else:
+          for i, v in enumerate(val):
+            if (i*4) >= length: break
+            libegpu.egpu_mmio_write32(self._if, c_uint64(self._base + start + i*4), c_uint32(int(v)))
+        libegpu.egpu_mmio_memory_barrier(self._if)
+        return
+      else:
+        raise NotImplementedError(self._fmt)
+    # Single element
+    off = self._base + idx * self._elt
     if self._fmt == 'I': libegpu.egpu_mmio_write32(self._if, c_uint64(off), c_uint32(val))
     elif self._fmt == 'B': libegpu.egpu_mmio_write8(self._if, c_uint64(off), c_uint32(val & 0xff))
     else: raise NotImplementedError(self._fmt)
     libegpu.egpu_mmio_memory_barrier(self._if)
 
   def view(self, offset: int = 0, size: int | None = None, fmt: str | None = None):
-    # For now, return self; higher layers don't rely on view semantics for MMIO
-    return self
+    # Return a shallow wrapper with adjusted base/size/format
+    return EGPUMMIOInterface.__new_with_existing(self._if, fmt or self._fmt, self._base + offset, size if size is not None else self._size_bytes - offset)
+
+  @classmethod
+  def __new_with_existing(cls, mmio_if: c_void_p, fmt: str, base_offset: int, size_bytes: int):
+    obj = object.__new__(cls)
+    obj._if = mmio_if
+    obj._fmt = fmt
+    obj._elt = struct.calcsize(fmt)
+    obj._base = base_offset
+    obj._size_bytes = size_bytes
+    return obj
 
 def open_device(device_id: int = 0):
   if libegpu is None:
