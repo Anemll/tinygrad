@@ -58,6 +58,15 @@ if libegpu is not None:
   libegpu.egpu_mmio_memory_barrier.argtypes = [c_void_p]
   libegpu.egpu_device_get_connection.restype = c_uint32
   libegpu.egpu_device_get_connection.argtypes = [c_void_p]
+  # DMA APIs
+  libegpu.egpu_device_allocate_dma_buffer.restype = c_uint64
+  libegpu.egpu_device_allocate_dma_buffer.argtypes = [c_void_p, c_uint64, c_uint32, POINTER(c_uint64), POINTER(c_uint64)]
+  libegpu.egpu_device_destroy_dma_buffer.restype = c_int
+  libegpu.egpu_device_destroy_dma_buffer.argtypes = [c_void_p, c_uint64]
+  libegpu.egpu_device_get_memory_type_for_handle.restype = c_uint32
+  libegpu.egpu_device_get_memory_type_for_handle.argtypes = [c_void_p, c_uint64]
+  libegpu.egpu_device_copy_dma_buffers.restype = c_int
+  libegpu.egpu_device_copy_dma_buffers.argtypes = [c_void_p, c_uint64, c_uint64, c_uint64, c_uint64]
 
 class EGPUMMIOInterface(MMIOInterface):
   def __init__(self, device_handle: c_void_p, bar_index: int, fmt: str = 'I'):
@@ -121,5 +130,50 @@ def open_device(device_id: int = 0):
   subvenid = 0
   rev = 0
   return mmio, vram, venid, subvenid, rev, bars
+
+
+class MacOSEGPUDevice:
+  def __init__(self, device_id: int = 0):
+    if libegpu is None: raise RuntimeError("libegpu_pcidevice.dylib not available")
+    req = (c_int * 3)(0, 2, 4)
+    self.handle = libegpu.egpu_device_create(device_id, req, 3)
+    if not self.handle: raise RuntimeError(f"Failed to open eGPU device {device_id}")
+    info_ptr = libegpu.egpu_device_get_info(self.handle)
+    if not info_ptr: raise RuntimeError("Failed to query eGPU device info")
+    self.info = info_ptr.contents
+    # Precompute bars dict
+    self.bars = {}
+    for i in range(int(self.info.bar_count)):
+      size = int(self.info.bar_sizes[i]); base = int(self.info.bar_bases[i])
+      if size > 0: self.bars[i] = (base, base + size - 1, 0)
+
+  def mmio_if(self, bar_index: int, fmt: str = 'I') -> EGPUMMIOInterface:
+    return EGPUMMIOInterface(self.handle, bar_index, fmt)
+
+  def get_connection(self) -> int:
+    return int(libegpu.egpu_device_get_connection(self.handle))
+
+  def allocate_dma_buffer(self, size: int, direction: int) -> dict:
+    phys = c_uint64(0); virt = c_uint64(0)
+    h = int(libegpu.egpu_device_allocate_dma_buffer(self.handle, c_uint64(size), c_uint32(direction), byref(phys), byref(virt)))
+    return {'handle': h, 'size': size, 'physical_addr': int(phys.value), 'virtual_addr': int(virt.value)} if h != 0 else None
+
+  def destroy_dma_buffer(self, handle: int) -> bool:
+    return int(libegpu.egpu_device_destroy_dma_buffer(self.handle, c_uint64(handle))) == 1
+
+  def get_memory_type_for_handle(self, handle: int) -> int:
+    return int(libegpu.egpu_device_get_memory_type_for_handle(self.handle, c_uint64(handle)))
+
+  def copy_dma_buffers(self, src_handle: int, dst_handle: int, offset: int, size: int) -> bool:
+    return int(libegpu.egpu_device_copy_dma_buffers(self.handle, c_uint64(src_handle), c_uint64(dst_handle), c_uint64(offset), c_uint64(size))) == 1
+
+
+_device_singleton: MacOSEGPUDevice|None = None
+
+def acquire_device(device_id: int = 0) -> MacOSEGPUDevice:
+  global _device_singleton
+  if _device_singleton is None:
+    _device_singleton = MacOSEGPUDevice(device_id)
+  return _device_singleton
 
 

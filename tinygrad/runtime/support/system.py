@@ -79,21 +79,17 @@ class _System:
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False, data:bytes|None=None, direction:int=DMA_DIRECTION_CPU_TO_GPU, name:str|None=None) -> tuple[int, list[int]]:
     if OSX:
-      # Use DriverKit DMA allocation on macOS
-      if self._egpu_device is None:
-        # Try to find an existing eGPU device first to avoid infinite recursion
-        self._egpu_device = self._find_existing_egpu_device()
-        if self._egpu_device is None:
-          raise RuntimeError("No eGPU device available for DMA allocation - ensure NVDev is initialized first")
-      
-      # Allocate DMA buffer using new dictionary-based approach
-      buffer_info = self._egpu_device.allocate_dma_buffer(size, 
-                      direction) # most are CPU to GPU for F/W
+      # Use DriverKit DMA allocation on macOS via macos_egpu provider
+      from tinygrad.runtime.support.nv.macos_egpu import acquire_device
+      dev = acquire_device(0)
+
+      # Allocate DMA buffer using provider
+      buffer_info = dev.allocate_dma_buffer(size, direction)
       if not buffer_info:
         raise RuntimeError(f"Failed to allocate DMA buffer of size {size}")
       
       # Get memory type ID for IOConnectMapMemory
-      memory_type = self._egpu_device.get_memory_type_for_handle(buffer_info['handle'])
+      memory_type = dev.get_memory_type_for_handle(buffer_info['handle'])
       if memory_type == 0:
         raise RuntimeError(f"Failed to get memory type for handle 0x{buffer_info['handle']:x}")
       
@@ -111,7 +107,7 @@ class _System:
       )
       
       # Step 2: Get IOKit connection handle
-      connection = self._egpu_device.get_connection()
+      connection = dev.get_connection()
       if not connection:
         raise RuntimeError("Failed to get IOKit connection handle")
       
@@ -584,28 +580,11 @@ class PCIDevice:
   
   def a(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
     if OSX:
-      # Lazy import to avoid circular dependency
-      from tinygrad.runtime.support.nv.egpudev import EGPUDev, EGPUMMIOInterface
-      
-      # Initialize eGPU device if not already done
-      if self.egpu_device is None:
-        self.egpu_device = EGPUDev(f"egpu{self.device_id}", self.device_id)
-      
-      # Get the platform-specific BAR index
+      # macOS path: use macos_egpu provider instead of egpudev
+      from tinygrad.runtime.support.nv.macos_egpu import acquire_device, EGPUMMIOInterface
+      dev = acquire_device(getattr(self, 'device_id', 0))
       actual_bar = self._bar_remap.get(bar, bar)
-      
-      # Return appropriate MMIO interface based on BAR
-      if bar == 0:  # MMIO registers
-        return self.egpu_device.mmio.view(off, size, fmt) if hasattr(self.egpu_device.mmio, 'view') else self.egpu_device.mmio
-      elif bar == 1:  # VRAM (Linux BAR1 -> platform BAR)
-        # Use the remapped BAR index
-        return EGPUMMIOInterface(self.egpu_device.device_handle, actual_bar, fmt)
-      elif bar == 3:  # Instruction memory (Linux BAR3 -> platform BAR)
-        # Use the remapped BAR index
-        return EGPUMMIOInterface(self.egpu_device.device_handle, actual_bar, fmt)
-      else:
-        # For other BARs, create interface with actual BAR index
-        return EGPUMMIOInterface(self.egpu_device.device_handle, actual_bar, fmt)
+      return EGPUMMIOInterface(dev.handle, actual_bar, fmt)
     fd, sz = self.bar_fds[bar], size or (self.bar_info[bar][1] - self.bar_info[bar][0] + 1)
     print(f"DEBUG: map_bar({bar}) - fd={fd.fd}, size={sz} ({sz/(1024**2):.0f}MB), addr=0x{addr:x}, off={off}")
     print(f"DEBUG: BAR {bar} info: start=0x{self.bar_info[bar][0]:x}, end=0x{self.bar_info[bar][1]:x}, flags=0x{self.bar_info[bar][2]:x}")
@@ -624,21 +603,10 @@ class PCIDevice:
   def map_bar(self, bar_idx: int, fmt: str = 'I'):
     """Map a BAR for memory access - macOS eGPU implementation"""
     if OSX:
-      # Initialize eGPU device if needed
-      if self.egpu_device is None:
-        from tinygrad.runtime.support.nv.egpudev import EGPUDev
-        self.egpu_device = EGPUDev(f"egpu{self.device_id}", self.device_id)
-      
-      # Return the appropriate MMIO interface based on BAR index
-      if bar_idx == 0:
-        return self.egpu_device.mmio  # BAR0 registers
-      elif bar_idx == 1:
-        # For compatibility, return BAR2 (VRAM) when BAR1 is requested
-        return self.egpu_device.vram  # BAR2/VRAM
-      else:
-        # For other BARs, try to create MMIO interface
-        from tinygrad.runtime.support.nv.egpudev import EGPUMMIOInterface
-        return EGPUMMIOInterface(self.egpu_device.device_handle, bar_idx, fmt=fmt)
+      # macOS path: use macos_egpu provider
+      from tinygrad.runtime.support.nv.macos_egpu import acquire_device, EGPUMMIOInterface
+      dev = acquire_device(getattr(self, 'device_id', 0))
+      return EGPUMMIOInterface(dev.handle, bar_idx if bar_idx != 1 else 2, fmt=fmt)
     else:
       # Linux implementation
       return self._mmap_bar(bar_idx, fmt)
