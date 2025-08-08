@@ -5,6 +5,7 @@ from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager
 from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
 from tinygrad.runtime.support.system import System, PCIDevImplBase
+from tinygrad.runtime.support.nv.macos_egpu import open_device as egpu_open_device
 
 NV_DEBUG = getenv("NV_DEBUG", 0)
 
@@ -103,6 +104,13 @@ class NVDev(PCIDevImplBase):
     for ip in [self.flcn, self.gsp]: ip.init_sw()
     for ip in [self.flcn, self.gsp]: ip.init_hw()
 
+  @classmethod
+  def from_egpu(cls, device_id: int = 0) -> NVDev:
+    """Factory for macOS eGPU using DriverKit provider, returns fully inited NVDev."""
+    mmio, vram, venid, subvenid, rev, bars = egpu_open_device(device_id)
+    dev = cls(devfmt=f"egpu{device_id}", mmio=mmio, vram=vram, venid=venid, subvenid=subvenid, rev=rev, bars=bars)
+    return dev
+
   def fini(self):
     for ip in [self.gsp, self.flcn]: ip.fini_hw()
 
@@ -146,7 +154,12 @@ class NVDev(PCIDevImplBase):
     self.vram_size = self.reg("NV_PGC6_AON_SECURE_SCRATCH_GROUP_42").read() << 20
 
   def _alloc_boot_struct(self, struct:ctypes.Structure) -> tuple[ctypes.Structure, int]:
-    va, paddrs = System.alloc_sysmem(sz:=ctypes.sizeof(type(struct)), contiguous=True)
+    va, paddrs = System.alloc_sysmem(
+      sz:=ctypes.sizeof(type(struct)),
+      contiguous=True,
+      direction=System.DMA_DIRECTION_CPU_TO_GPU,
+      name=f"BOOT_STRUCT_{type(struct).__name__}"
+    )
     to_mv(va, sz)[:] = bytes(struct)
     return type(struct).from_address(va), paddrs[0]
 

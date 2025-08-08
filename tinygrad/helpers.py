@@ -322,10 +322,56 @@ def capstone_flatdump(lib: bytes):
     print(f"{instr.address:#08x}: {instr.mnemonic}\t{instr.op_str}")
   sys.stdout.flush()
 
-def wait_cond(cb, value=True, timeout_ms=10000, msg="") -> bool:
+def wait_cond(cb, value=True, timeout_ms=10000, msg: str = "", debug_wait: int|None=None) -> bool:
   start_time = int(time.perf_counter() * 1000)
+  if debug_wait is not None and DEBUG >= debug_wait:
+    print(f"[wait_cond] START: {msg} at {start_time}ms")
+
+  last_val = None
+  last_head = None
+  last_tail = None
+  repeat_count = 0
+  val = None
+
   while int(time.perf_counter() * 1000) - start_time < timeout_ms:
-    if (val:=cb()) == value: return val
+    val = cb()
+
+    if debug_wait is not None and DEBUG >= debug_wait:
+      head, tail = None, None
+      # Try to extract HEAD/TAIL for NV_PFSP_MSGQ special case
+      try:
+        if hasattr(cb, '__closure__') and cb.__closure__:
+          closure_vars = [c.cell_contents for c in cb.__closure__ if hasattr(c, 'cell_contents')]
+          for var in closure_vars:
+            target = var
+            # also check nested nvdev if present
+            if hasattr(target, 'nvdev'): target = getattr(target, 'nvdev')
+            if hasattr(target, 'NV_PFSP_MSGQ_HEAD') and hasattr(target, 'NV_PFSP_MSGQ_TAIL'):
+              head = target.NV_PFSP_MSGQ_HEAD[0].read()
+              tail = target.NV_PFSP_MSGQ_TAIL[0].read()
+              break
+      except Exception:
+        pass
+
+      if val == last_val and head == last_head and tail == last_tail:
+        repeat_count += 1
+      else:
+        if repeat_count > 0:
+          print(f"[wait_cond] ... repeated {repeat_count} more times")
+        if head is not None and tail is not None:
+          print(f"[wait_cond] cb() = {val}, HEAD = {head}, TAIL = {tail}")
+        else:
+          print(f"[wait_cond] cb() = {val}")
+        last_val, last_head, last_tail, repeat_count = val, head, tail, 0
+
+    if val == value:
+      elapsed_ms = int(time.perf_counter() * 1000) - start_time
+      if debug_wait is not None and DEBUG >= debug_wait:
+        if repeat_count > 0:
+          print(f"[wait_cond] ... repeated {repeat_count} more times")
+        print(f"[wait_cond] EXIT: condition met after {elapsed_ms}ms")
+      return val
+
   raise TimeoutError(f"{msg}. Timed out after {timeout_ms} ms, condition not met: {val} != {value}")
 
 # *** ctypes helpers

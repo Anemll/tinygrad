@@ -18,13 +18,22 @@ class NV_IP:
 
 class NVRpcQueue:
   def __init__(self, gsp:NV_GSP, va:int, completion_q_va:int|None=None):
+    if DEBUG >= 1:
+      print(f"NVRpcQueue.__init__: initialize RPC queue (va=0x{va:x}); wait for TX header entryOff==0x1000")
     self.tx = nv.msgqTxHeader.from_address(va)
-    wait_cond(lambda: self.tx.entryOff, value=0x1000, msg="RPC queue not initialized")
+    if True:
+      wait_cond(lambda: self.tx.entryOff, value=0x1000, msg="[NVRpcQueue.__init__] RPC queue not initialized", debug_wait=2)
+    else:
+      for i in range(10):
+        print(f"FSP Read-before-write-0: {self.tx.entryOff}")
+        time.sleep(0.1)
 
     if completion_q_va is not None: self.rx = nv.msgqRxHeader.from_address(completion_q_va + nv.msgqTxHeader.from_address(completion_q_va).rxHdrOff)
 
     self.gsp, self.va, self.queue_va, self.seq = gsp, va, va + self.tx.entryOff, 0
     self.queue_mv = to_mv(self.queue_va, self.tx.msgSize * self.tx.msgCount)
+    if DEBUG >= 1:
+      print(f"NVRpcQueue.__init__: TX ready (msgSize=0x{self.tx.msgSize:x}, msgCount={self.tx.msgCount}), queue_va=0x{self.queue_va:x}")
 
   def _checksum(self, data:bytes):
     if (pad_len:=(-len(data)) % 8): data += b'\x00' * pad_len
@@ -76,6 +85,8 @@ class NVRpcQueue:
 
 class NV_FLCN(NV_IP):
   def init_sw(self):
+    if DEBUG >= 1:
+      print("NV_FLCN.init_sw: prepare Falcon microcode and booter from VBIOS (FRTS/booter artifacts)")
     self.nvdev.include("src/common/inc/swref/published/ampere/ga102/dev_gsp.h")
     self.nvdev.include("src/common/inc/swref/published/ampere/ga102/dev_falcon_v4.h")
     self.nvdev.include("src/common/inc/swref/published/ampere/ga102/dev_falcon_v4_addendum.h")
@@ -136,7 +147,13 @@ class NV_FLCN(NV_IP):
       patched_image[(cmd_off:=self.desc_v3.IMEMLoadSize+dmem.cmd_in_buffer_offset) : cmd_off+len(cmd)] = cmd
       patched_image[(sig_off:=self.desc_v3.IMEMLoadSize+self.desc_v3.PKCDataOffset) : sig_off+0x180] = signature[-0x180:]
 
-      return System.alloc_sysmem(len(patched_image), contiguous=True, data=patched_image)
+      return System.alloc_sysmem(
+        len(patched_image),
+        contiguous=True,
+        data=patched_image,
+        direction=System.DMA_DIRECTION_CPU_TO_GPU,
+        name=f"FALCON_IMAGE_CMD_{cmd_id:02x}"
+      )
 
     self.frts_image_va, self.frts_image_sysmem = __patch(0x15, bytes(frts_cmd))
 
@@ -149,10 +166,20 @@ class NV_FLCN(NV_IP):
 
     patched_image = bytearray(image)
     patched_image[patch_loc:patch_loc+sig_len] = sig[:sig_len]
-    self.booter_image_va, self.booter_image_sysmem = System.alloc_sysmem(len(patched_image), contiguous=True, data=patched_image)
+    self.booter_image_va, self.booter_image_sysmem = System.alloc_sysmem(
+      len(patched_image),
+      contiguous=True,
+      data=patched_image,
+      direction=System.DMA_DIRECTION_CPU_TO_GPU,
+      name="BOOTER_UCODE_IMAGE"
+    )
     _, _, self.booter_data_off, self.booter_data_sz, _, self.booter_code_off, self.booter_code_sz, _, _ = struct.unpack("9I", header)
 
   def init_hw(self):
+    if DEBUG >= 1:
+      print("NV_FLCN.init_hw: reset/load Falcon images, execute secure handshakes, set mailboxes, verify WPR2/RISCV")
+    # Print firmware state before bringing up queues
+    self.debug_firmware_state()
     self.falcon, self.sec2 = 0x00110000, 0x00840000
 
     self.reset(self.falcon)
@@ -179,28 +206,28 @@ class NV_FLCN(NV_IP):
     assert self.nvdev.NV_PRISCV_RISCV_CPUCTL.with_base(self.falcon).read_bitfields()['active_stat'] == 1, "GSP Core is not active"
 
   def execute_dma(self, base:int, cmd:int, dest:int, mem_off:int, sysmem:int, size:int):
-    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['full'], value=0, msg="DMA does not progress")
+    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['full'], value=0, msg="[NV_FLCN.execute_dma] DMA does not progress", debug_wait=2)
 
     self.nvdev.NV_PFALCON_FALCON_DMATRFBASE.with_base(base).write(lo32(sysmem >> 8))
     self.nvdev.NV_PFALCON_FALCON_DMATRFBASE1.with_base(base).write(hi32(sysmem >> 8) & 0x1ff)
 
     xfered = 0
     while xfered < size:
-      wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['full'], value=0, msg="DMA does not progress")
+      wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['full'], value=0, msg="[NV_FLCN.execute_dma] DMA does not progress", debug_wait=2)
 
       self.nvdev.NV_PFALCON_FALCON_DMATRFMOFFS.with_base(base).write(dest + xfered)
       self.nvdev.NV_PFALCON_FALCON_DMATRFFBOFFS.with_base(base).write(mem_off + xfered)
       self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).write(cmd)
       xfered += 256
 
-    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['idle'], msg="DMA does not complete")
+    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).read_bitfields()['idle'], msg="[NV_FLCN.execute_dma] DMA does not complete", debug_wait=2)
 
   def start_cpu(self, base:int):
     if self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['alias_en'] == 1:
       self.nvdev.wreg(base + self.nvdev.NV_PFALCON_FALCON_CPUCTL_ALIAS, 0x2)
     else: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).write(startcpu=1)
 
-  def wait_cpu_halted(self, base): wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['halted'], msg="not halted")
+  def wait_cpu_halted(self, base): wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['halted'], msg="[NV_FLCN.wait_cpu_halted] not halted", debug_wait=2)
 
   def execute_hs(self, base, img_sysmem, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid, mailbox=None):
     self.disable_ctx_req(base)
@@ -243,16 +270,18 @@ class NV_FLCN(NV_IP):
     time.sleep(0.1)
     engine_reg.write(reset=0)
 
-    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(base).read_bitfields()['mem_scrubbing'], value=0, msg="Scrubbing not completed")
+    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(base).read_bitfields()['mem_scrubbing'], value=0, msg="[NV_FLCN.reset] Scrubbing not completed", debug_wait=2)
 
     if riscv: self.nvdev.NV_PRISCV_RISCV_BCR_CTRL.with_base(base).write(core_select=1, valid=0, brfetch=1)
     elif self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(base).read_bitfields()['riscv'] == 1:
       self.nvdev.NV_PRISCV_RISCV_BCR_CTRL.with_base(base).write(core_select=0)
-      wait_cond(lambda: self.nvdev.NV_PRISCV_RISCV_BCR_CTRL.with_base(base).read_bitfields()['valid'], msg="RISCV core not booted")
+      wait_cond(lambda: self.nvdev.NV_PRISCV_RISCV_BCR_CTRL.with_base(base).read_bitfields()['valid'], msg="[NV_FLCN.reset] RISCV core not booted", debug_wait=2)
       self.nvdev.NV_PFALCON_FALCON_RM.with_base(base).write(self.nvdev.chip_id)
 
 class NV_FLCN_COT(NV_IP):
   def init_sw(self):
+    if DEBUG >= 1:
+      print("NV_FLCN_COT.init_sw: prepare FMC booter and related material")
     self.nvdev.include("src/common/inc/swref/published/ampere/ga102/dev_gsp.h")
     self.nvdev.include("src/common/inc/swref/published/hopper/gh100/dev_falcon_v4.h")
     self.nvdev.include("src/common/inc/swref/published/hopper/gh100/dev_vm.h")
@@ -269,9 +298,17 @@ class NV_FLCN_COT(NV_IP):
     self.fmc_booter_hash = memoryview(self.nvdev.extract_fw("kgspBinArchiveGspRmFmcGfwProdSigned", "ucode_hash_data")).cast('I')
     self.fmc_booter_sig = memoryview(self.nvdev.extract_fw("kgspBinArchiveGspRmFmcGfwProdSigned", "ucode_sig_data")).cast('I')
     self.fmc_booter_pkey = memoryview(self.nvdev.extract_fw("kgspBinArchiveGspRmFmcGfwProdSigned", "ucode_pkey_data") + b'\x00\x00\x00').cast('I')
-    _, self.fmc_booter_sysmem = System.alloc_sysmem(len(self.fmc_booter_image), contiguous=True, data=self.fmc_booter_image)
+    _, self.fmc_booter_sysmem = System.alloc_sysmem(
+      len(self.fmc_booter_image),
+      contiguous=True,
+      data=self.fmc_booter_image,
+      direction=System.DMA_DIRECTION_CPU_TO_GPU,
+      name="FMC_BOOTER_UCODE_IMAGE"
+    )
 
   def init_hw(self):
+    if DEBUG >= 1:
+      print("NV_FLCN_COT.init_hw: send CoT message to FSP; wait for riscv_br_priv_lockdown to clear")
     self.falcon = 0x00110000
 
     self.fmc_boot_args.bootGspRmParams = nv.GSP_ACR_BOOT_GSP_RM_PARAMS(gspRmDescOffset=self.nvdev.gsp.wpr_meta_sysmem,
@@ -285,7 +322,23 @@ class NV_FLCN_COT(NV_IP):
     for i,x in enumerate(self.fmc_booter_pkey): cot_payload.publicKey[i] = x
 
     self.kfsp_send_msg(nv.NVDM_TYPE_COT, bytes(cot_payload))
-    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read_bitfields()['riscv_br_priv_lockdown'], value=0)
+    #for i in range(10):
+    #  print(f"FSP SENT COT {self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read_bitfields()['riscv_br_priv_lockdown']}")
+    #  time.sleep(0.1)
+    # check 
+    try:
+      self.debug_firmware_state()
+    except Exception:
+      pass
+
+    wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read_bitfields()['riscv_br_priv_lockdown'], value=0, msg="[NV_FLCN_COT.init_hw] RISCV lockdown not released", debug_wait=2)
+    #time.sleep(1)
+    try:
+      self.debug_firmware_state()
+    except Exception:
+      pass
+    print("init_hw")
+
 
   def kfsp_send_msg(self, nvmd:int, buf:bytes):
     # All single-packets go to seid 0
@@ -296,17 +349,69 @@ class NV_FLCN_COT(NV_IP):
     self.nvdev.NV_PFSP_EMEMC[0].write(offs=0, blk=0, aincw=1, aincr=0)
     for i in range(0, len(buf), 4): self.nvdev.NV_PFSP_EMEMD[0].write(int.from_bytes(buf[i:i+4], 'little'))
 
+    tail = self.nvdev.NV_PFSP_QUEUE_TAIL[0].read()
+    head = self.nvdev.NV_PFSP_QUEUE_HEAD[0].read()
+
+    print(f"FSP Read-after-write: {tail} {head}")
+    print(f"FSP expected: {len(buf) - 4}")
     self.nvdev.NV_PFSP_QUEUE_TAIL[0].write(len(buf) - 4)
+    #print(f"FSP Read-after-write-1: {self.nvdev.NV_PFSP_QUEUE_TAIL[0].read()}")
+    #time.sleep(0.1)
     self.nvdev.NV_PFSP_QUEUE_HEAD[0].write(0)
+    #print(f"FSP Read-after-write-1: {self.nvdev.NV_PFSP_QUEUE_TAIL[0].read()}")
+    #time.sleep(0.1)
+
 
     # Waiting for a response
-    wait_cond(lambda: self.nvdev.NV_PFSP_MSGQ_HEAD[0].read() != self.nvdev.NV_PFSP_MSGQ_TAIL[0].read(), msg="FSP didn't respond to message")
+    if False :
+      for _ in range(20):
+        h = self.nvdev.NV_PFSP_MSGQ_HEAD[0].read()
+        t = self.nvdev.NV_PFSP_MSGQ_TAIL[0].read()
+        print(f"FSP Read-HEAD: {h} TAIL: {t}")
+        if h != t:
+          print("FSP RESPONDED!")
+          break
+        time.sleep(0.1)
 
+    #  print(f"FSP Read-HEAD: {self.nvdev.NV_PFSP_MSGQ_HEAD[0].read()}")
+    #  print(f"FSP Read-TAIL: {self.nvdev.NV_PFSP_MSGQ_TAIL[0].read()}")
+    #  time.sleep(0.1)
+
+    wait_cond(lambda: self.nvdev.NV_PFSP_MSGQ_HEAD[0].read() != self.nvdev.NV_PFSP_MSGQ_TAIL[0].read(), msg="[NV_FLCN_COT.kfsp_send_msg] FSP didn't respond to message", debug_wait=2)
+
+    #time.sleep(1)
     self.nvdev.NV_PFSP_EMEMC[0].write(offs=0, blk=0, aincw=0, aincr=1)
     self.nvdev.NV_PFSP_MSGQ_TAIL[0].write(self.nvdev.NV_PFSP_MSGQ_HEAD[0].read())
+    print("done kfsp_send_msg")
 
 class NV_GSP(NV_IP):
+  def debug_firmware_state(self):
+    # Read key readiness indicators and print an overall estimation
+    try:
+      lockdown = self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.nvdev.flcn.falcon).read_bitfields().get('riscv_br_priv_lockdown', None)
+    except Exception:
+      lockdown = None
+    try:
+      active = self.nvdev.NV_PRISCV_RISCV_CPUCTL.with_base(self.nvdev.flcn.falcon).read_bitfields().get('active_stat', None)
+    except Exception:
+      active = None
+    try:
+      stat_tx_entry_off = nv.msgqTxHeader.from_address(self.stat_q_va).entryOff
+    except Exception:
+      stat_tx_entry_off = None
+
+    print(f"FW State: lockdown={lockdown}, riscv_active={active}, stat_entryOff={stat_tx_entry_off}")
+
+    # Heuristic readiness estimation
+    ready_cot = (lockdown == 0)
+    ready_core = (active == 1)
+    ready_queue = (stat_tx_entry_off == 0x1000)
+    overall = ready_cot and ready_core and ready_queue
+    print(f"FW Ready? cot={ready_cot}, core={ready_core}, queue={ready_queue} -> {overall}")
+    return overall
   def init_sw(self):
+    if DEBUG >= 1:
+      print("NV_GSP.init_sw: allocate RPC queues, build radix-3 image/signature and boot binary, setup libOS/log buffers")
     self.handle_gen = itertools.count(0xcf000000)
     self.init_rm_args()
     self.init_libos_args()
@@ -326,7 +431,16 @@ class NV_GSP(NV_IP):
     # Alloc queues
     pte_cnt = ((queue_pte_cnt:=(queue_size * 2) // 0x1000)) + round_up(queue_pte_cnt * 8, 0x1000) // 0x1000
     pt_size = round_up(pte_cnt * 8, 0x1000)
-    queues_va, queues_sysmem = System.alloc_sysmem(pt_size + queue_size * 2, contiguous=False)
+    queues_va, queues_sysmem = System.alloc_sysmem(
+      pt_size + queue_size * 2,
+      contiguous=False,
+      direction=System.DMA_DIRECTION_BIDIRECTIONAL,
+      name=f"GSP_MSGQ_PT+CMD+STAT_{pt_size + queue_size * 2}"
+    )
+
+    # Remember sizes/offsets for potential reinitialization after COT
+    self.queue_size = queue_size
+    self.pt_size = pt_size
 
     # Fill up ptes
     for i, sysmem in enumerate(queues_sysmem): to_mv(queues_va + i * 0x8, 0x8).cast('Q')[0] = sysmem
@@ -346,8 +460,18 @@ class NV_GSP(NV_IP):
     self.cmd_q = NVRpcQueue(self, self.cmd_q_va, None)
 
   def init_libos_args(self):
-    _, logbuf_sysmem = System.alloc_sysmem((2 << 20), contiguous=True)
-    libos_args_va, self.libos_args_sysmem = System.alloc_sysmem(0x1000, contiguous=True)
+    _, logbuf_sysmem = System.alloc_sysmem(
+      (2 << 20),
+      contiguous=True,
+      direction=System.DMA_DIRECTION_GPU_TO_CPU,
+      name="LIBOS_LOG_BUFFER_REGION"
+    )
+    libos_args_va, self.libos_args_sysmem = System.alloc_sysmem(
+      0x1000,
+      contiguous=True,
+      direction=System.DMA_DIRECTION_CPU_TO_GPU,
+      name="LIBOS_ARGS_BLOCK"
+    )
 
     libos_structs = (nv.LibosMemoryRegionInitArgument * 6).from_address(libos_args_va)
     for i, name in enumerate(["INIT", "INTR", "RM", "MNOC", "KRNL"]):
@@ -369,7 +493,12 @@ class NV_GSP(NV_IP):
     for i in range(3, 0, -1): npages[i-1] = ((npages[i] - 1) >> (nv.LIBOS_MEMORY_REGION_RADIX_PAGE_LOG2 - 3)) + 1
 
     offsets = [sum(npages[:i]) * 0x1000 for i in range(4)]
-    radix_va, self.gsp_radix3_sysmem = System.alloc_sysmem(offsets[-1] + len(self.gsp_image), contiguous=False)
+    radix_va, self.gsp_radix3_sysmem = System.alloc_sysmem(
+      offsets[-1] + len(self.gsp_image),
+      contiguous=False,
+      direction=System.DMA_DIRECTION_CPU_TO_GPU,
+      name="GSP_RADIX3_IMAGE_AND_PT"
+    )
 
     # Copy image
     to_mv(radix_va + offsets[-1], len(self.gsp_image))[:] = self.gsp_image
@@ -380,12 +509,24 @@ class NV_GSP(NV_IP):
       to_mv(radix_va + offsets[i], npages[i+1] * 8).cast('Q')[:] = array.array('Q', self.gsp_radix3_sysmem[cur_offset:cur_offset+npages[i+1]])
 
     # Copy signature
-    self.gsp_signature_va, self.gsp_signature_sysmem = System.alloc_sysmem(len(signature), contiguous=True, data=signature)
+    self.gsp_signature_va, self.gsp_signature_sysmem = System.alloc_sysmem(
+      len(signature),
+      contiguous=True,
+      data=signature,
+      direction=System.DMA_DIRECTION_CPU_TO_GPU,
+      name="GSP_IMAGE_SIGNATURE"
+    )
 
   def init_boot_binary_image(self):
     self.booter_image = self.nvdev.extract_fw("kgspBinArchiveGspRmBoot", "ucode_image_prod_data")
     self.booter_desc = nv.RM_RISCV_UCODE_DESC.from_buffer_copy(self.nvdev.extract_fw("kgspBinArchiveGspRmBoot", "ucode_desc_prod_data"))
-    _, self.booter_sysmem = System.alloc_sysmem(len(self.booter_image), contiguous=True, data=self.booter_image)
+    _, self.booter_sysmem = System.alloc_sysmem(
+      len(self.booter_image),
+      contiguous=True,
+      data=self.booter_image,
+      direction=System.DMA_DIRECTION_CPU_TO_GPU,
+      name="GSP_BOOTER_IMAGE"
+    )
 
   def init_wpr_meta(self):
     self.init_gsp_image()
@@ -460,6 +601,35 @@ class NV_GSP(NV_IP):
     self.rpc_rm_alloc(hParent=ch_gpfifo, hClass=self.dma_class, params=None)
 
   def init_hw(self):
+    if DEBUG >= 1:
+      print("NV_GSP.init_hw: bring up RPC channels, wait for GSP_INIT_DONE, configure BARs, initialize golden image")
+    # Rebuild command queue TX header if firmware (COT) cleared it
+    try:
+      txhdr = nv.msgqTxHeader.from_address(self.cmd_q_va)
+      if txhdr.entryOff != 0x1000:
+        cmd_q_tx = nv.msgqTxHeader(
+          version=0,
+          size=self.queue_size,
+          entryOff=0x1000,
+          msgSize=0x1000,
+          msgCount=(self.queue_size - 0x1000) // 0x1000,
+          writePtr=0,
+          flags=1,
+          rxHdrOff=ctypes.sizeof(nv.msgqTxHeader)
+        )
+        to_mv(self.cmd_q_va, ctypes.sizeof(nv.msgqTxHeader))[:] = bytes(cmd_q_tx)
+        System.memory_barrier()
+        self.cmd_q = NVRpcQueue(self, self.cmd_q_va, None)
+    except Exception:
+      pass
+
+    # Wait for firmware to set up the status queue TX header
+    wait_cond(
+      lambda: nv.msgqTxHeader.from_address(self.stat_q_va).entryOff == 0x1000,
+      msg="[NV_GSP.init_hw] STAT queue header not initialized by firmware",
+      debug_wait=2
+    )
+
     self.stat_q = NVRpcQueue(self, self.stat_q_va, self.cmd_q_va)
     self.cmd_q.rx = nv.msgqRxHeader.from_address(self.stat_q.va + self.stat_q.tx.rxHdrOff)
 
@@ -481,7 +651,12 @@ class NV_GSP(NV_IP):
       params.ramfcMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x200, addressSpace=2, cacheAttrib=0)
       params.instanceMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x1000, addressSpace=2, cacheAttrib=0)
 
-      method_va, method_sysmem = System.alloc_sysmem(0x5000, contiguous=True)
+      method_va, method_sysmem = System.alloc_sysmem(
+        0x5000,
+        contiguous=True,
+        direction=System.DMA_DIRECTION_CPU_TO_GPU,
+        name="NV_METHOD_BUFFER"
+      )
       params.mthdbufMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=method_sysmem[0], size=0x5000, addressSpace=1, cacheAttrib=0)
 
       if client is not None and client != self.priv_root and params.hObjectError != 0:
@@ -521,9 +696,45 @@ class NV_GSP(NV_IP):
     self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_SET_PAGE_DIRECTORY)
 
   def rpc_set_gsp_system_info(self):
-    def bdf_as_int(s): return (int(s[5:7],16)<<8) | (int(s[8:10],16)<<3) | int(s[-1],16)
+    def bdf_as_int(s): 
+      if s.startswith('egpu'):
+        # eGPU format: "egpu0" -> return device ID (0 for first eGPU)
+        return int(s[4:]) if len(s) > 4 and s[4:].isdigit() else 0
+      else:
+        # PCI format: "0000:01:00.0" -> parse bus:device.function
+        return (int(s[5:7],16)<<8) | (int(s[8:10],16)<<3) | int(s[-1],16)
 
-    data = nv.GspSystemInfo(gpuPhysAddr=self.nvdev.bars[0][0], gpuPhysFbAddr=self.nvdev.bars[1][0], gpuPhysInstAddr=self.nvdev.bars[3][0],
+    from tinygrad.runtime.support.system import OSX
+    
+    # Debug: Print available BAR keys
+    print(f"🔍 Available nvdev.bars keys: {list(self.nvdev.bars.keys())}")
+    print(f"🔍 nvdev.bars content: {self.nvdev.bars}")
+    
+    if OSX:
+      # macOS eGPU: Use DriverKit detected BARs
+      # Expected: BAR0=control, BAR2=VRAM, BAR4=instruction memory
+      available_bars = list(self.nvdev.bars.keys())
+      print(f"🔍 Available BARs on macOS: {available_bars}")
+      
+      # Map BARs based on DriverKit detection
+      gpuPhysAddr = self.nvdev.bars.get(0, (0, 0))[0]    # BAR 0 - Control/registers
+      gpuPhysFbAddr = self.nvdev.bars.get(2, (0, 0))[0]  # BAR 2 - VRAM/frame buffer  
+      gpuPhysInstAddr = self.nvdev.bars.get(4, gpuPhysFbAddr)[0] if 4 in self.nvdev.bars else gpuPhysFbAddr  # BAR 4 - Instruction memory, fallback to BAR 2
+      
+      print(f"🔍 macOS eGPU BAR mapping: GPU=0x{gpuPhysAddr:x}, FB=0x{gpuPhysFbAddr:x}, Inst=0x{gpuPhysInstAddr:x}")
+      
+      # Validate we have the essential BARs
+      if gpuPhysAddr == 0:
+        raise RuntimeError("❌ BAR 0 (control registers) not available")
+      if gpuPhysFbAddr == 0:
+        raise RuntimeError("❌ BAR 2 (VRAM) not available")
+    else:
+      # Linux BAR mapping: 0, 1, 3
+      gpuPhysAddr = self.nvdev.bars[0][0]      # BAR 0 - GPU memory
+      gpuPhysFbAddr = self.nvdev.bars[1][0]    # BAR 1 - Frame buffer
+      gpuPhysInstAddr = self.nvdev.bars[3][0]  # BAR 3 - Instruction memory
+
+    data = nv.GspSystemInfo(gpuPhysAddr=gpuPhysAddr, gpuPhysFbAddr=gpuPhysFbAddr, gpuPhysInstAddr=gpuPhysInstAddr,
       pciConfigMirrorBase=[0x88000, 0x92000][self.nvdev.fmc_boot], pciConfigMirrorSize=0x1000, nvDomainBusDeviceFunc=bdf_as_int(self.nvdev.devfmt),
       bIsPassthru=1, PCIDeviceID=self.nvdev.venid, PCISubDeviceID=self.nvdev.subvenid, PCIRevisionID=self.nvdev.rev, maxUserVa=0x7ffffffff000)
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, bytes(data))
@@ -557,7 +768,7 @@ class NV_GSP(NV_IP):
         self.nvdev.wreg(addr, (self.nvdev.rreg(addr) & ~mask) | (val & mask))
       elif op == 0x2: # reg poll
         addr, mask, val, _, _ = next(cmd_iter), next(cmd_iter), next(cmd_iter), next(cmd_iter), next(cmd_iter)
-        wait_cond(lambda: (self.nvdev.rreg(addr) & mask), value=val, msg=f"Register {addr:#x} not equal to {val:#x} after polling")
+        wait_cond(lambda: (self.nvdev.rreg(addr) & mask), value=val, msg=f"[NV_GSP.run_cpu_seq] Register {addr:#x} not equal to {val:#x} after polling", debug_wait=2)
       elif op == 0x3: time.sleep(next(cmd_iter) / 1e6) # delay us
       elif op == 0x4: # save reg
         addr, index = next(cmd_iter), next(cmd_iter)
@@ -574,7 +785,7 @@ class NV_GSP(NV_IP):
         self.nvdev.NV_PGSP_FALCON_MAILBOX1.write(hi32(self.libos_args_sysmem[0]))
 
         self.nvdev.flcn.start_cpu(self.nvdev.flcn.sec2)
-        wait_cond(lambda: self.nvdev.NV_PGC6_BSI_SECURE_SCRATCH_14.read_bitfields()['boot_stage_3_handoff'], msg="SEC2 didn't hand off")
+        wait_cond(lambda: self.nvdev.NV_PGC6_BSI_SECURE_SCRATCH_14.read_bitfields()['boot_stage_3_handoff'], msg="[NV_GSP.run_cpu_seq] SEC2 didn't hand off", debug_wait=2)
 
         mailbox = self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(self.nvdev.flcn.sec2).read()
         assert mailbox == 0x0, f"Falcon SEC2 failed to execute, mailbox is {mailbox:08x}"
