@@ -623,13 +623,7 @@ class NV_GSP(NV_IP):
     except Exception:
       pass
 
-    # Wait for firmware to set up the status queue TX header
-    wait_cond(
-      lambda: nv.msgqTxHeader.from_address(self.stat_q_va).entryOff == 0x1000,
-      msg="[NV_GSP.init_hw] STAT queue header not initialized by firmware",
-      debug_wait=2
-    )
-
+    # Upstream sequence: create status queue and immediately wait for INIT_DONE
     self.stat_q = NVRpcQueue(self, self.stat_q_va, self.cmd_q_va)
     self.cmd_q.rx = nv.msgqRxHeader.from_address(self.stat_q.va + self.stat_q.tx.rxHdrOff)
 
