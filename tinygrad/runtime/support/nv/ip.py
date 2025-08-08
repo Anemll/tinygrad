@@ -63,6 +63,10 @@ class NVRpcQueue:
     self.gsp.nvdev.NV_PGSP_QUEUE_HEAD[0].write(0x0)
 
   def wait_resp(self, cmd:int) -> memoryview:
+    # Optional timeout/ignore for debugging
+    timeout_ms = int(getenv("NV_RPC_WAIT_TIMEOUT_MS", 0))
+    ignore_fail = bool(getenv("NV_IGNORE_RPC_FAIL", 0))
+    st_ms = int(time.perf_counter() * 1000)
     while True:
       System.memory_barrier()
       if self.rx.readPtr == self.tx.writePtr: continue
@@ -86,6 +90,14 @@ class NVRpcQueue:
 
       if hdr.rpc_result != 0: raise RuntimeError(f"RPC call {hdr.function} failed with result {hdr.rpc_result}")
       if hdr.function == cmd: return msg
+
+      # Timeout handling for debugging
+      if timeout_ms > 0 and (int(time.perf_counter() * 1000) - st_ms) > timeout_ms:
+        if DEBUG >= 1:
+          print(f"NVRpcQueue.wait_resp: timeout waiting for cmd {cmd:#x} (ignore={ignore_fail})")
+        if ignore_fail:
+          return memoryview(b"")
+        raise TimeoutError(f"RPC wait timed out for cmd {cmd:#x}")
 
 class NV_FLCN(NV_IP):
   def init_sw(self):
