@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes, time, array, struct, itertools, dataclasses
 from typing import cast, Any
 from tinygrad.runtime.autogen.nv import nv
-from tinygrad.helpers import to_mv, lo32, hi32, DEBUG, round_up, round_down, mv_address, fetch, wait_cond, getenv
+from tinygrad.helpers import to_mv, lo32, hi32, DEBUG, round_up, round_down, mv_address, fetch, wait_cond, getenv, OSX
 from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.autogen import nv_gpu
@@ -196,16 +196,20 @@ class NV_FLCN(NV_IP):
       print("NV_FLCN.init_hw: reset/load Falcon images, execute secure handshakes, set mailboxes, verify WPR2/RISCV")
     # Print firmware state before bringing up queues
     self.debug_firmware_state()
+    if getenv("NV_SNAPSHOT", 0): self.nvdev.gsp.debug_snapshot("flcn_pre")
     self.falcon, self.sec2 = 0x00110000, 0x00840000
 
     self.reset(self.falcon)
+    if getenv("NV_SNAPSHOT", 0): self.nvdev.gsp.debug_snapshot("flcn_after_reset")
     self.execute_hs(self.falcon, self.frts_image_sysmem[0], code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
       imemPa=self.desc_v3.IMEMPhysBase, imemVa=self.desc_v3.IMEMVirtBase, imemSz=self.desc_v3.IMEMLoadSize,
       dmemPa=self.desc_v3.DMEMPhysBase, dmemVa=0x0, dmemSz=self.desc_v3.DMEMLoadSize,
       pkc_off=self.desc_v3.PKCDataOffset, engid=self.desc_v3.EngineIdMask, ucodeid=self.desc_v3.UcodeId)
     assert self.nvdev.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read() != 0, "WPR2 is not initialized"
+    if getenv("NV_SNAPSHOT", 0): self.nvdev.gsp.debug_snapshot("flcn_after_execute_hs")
 
     self.reset(self.falcon, riscv=True)
+    if getenv("NV_SNAPSHOT", 0): self.nvdev.gsp.debug_snapshot("flcn_after_riscv_reset")
 
     # set up the mailbox
     self.nvdev.NV_PGSP_FALCON_MAILBOX0.write(lo32(self.nvdev.gsp.libos_args_sysmem[0]))
@@ -217,6 +221,7 @@ class NV_FLCN(NV_IP):
       imemPa=0x0, imemVa=self.booter_code_off, imemSz=self.booter_code_sz, dmemPa=0x0, dmemVa=0x0, dmemSz=self.booter_data_sz,
       pkc_off=0x10, engid=1, ucodeid=3, mailbox=self.nvdev.gsp.wpr_meta_sysmem)
     assert mbx[0] == 0x0, f"Booter failed to execute, mailbox is {mbx[0]:08x}, {mbx[1]:08x}"
+    if getenv("NV_SNAPSHOT", 0): self.nvdev.gsp.debug_snapshot("flcn_after_sec2_booter")
 
     self.nvdev.NV_PFALCON_FALCON_OS.with_base(self.falcon).write(0x0)
     assert self.nvdev.NV_PRISCV_RISCV_CPUCTL.with_base(self.falcon).read_bitfields()['active_stat'] == 1, "GSP Core is not active"
@@ -337,6 +342,7 @@ class NV_FLCN_COT(NV_IP):
     for i,x in enumerate(self.fmc_booter_sig): cot_payload.signature[i] = x
     for i,x in enumerate(self.fmc_booter_pkey): cot_payload.publicKey[i] = x
 
+    if getenv("NV_SNAPSHOT", 0): self.nvdev.gsp.debug_snapshot("cot_pre_send")
     self.kfsp_send_msg(nv.NVDM_TYPE_COT, bytes(cot_payload))
     #for i in range(10):
     #  print(f"FSP SENT COT {self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read_bitfields()['riscv_br_priv_lockdown']}")
@@ -354,6 +360,7 @@ class NV_FLCN_COT(NV_IP):
     except Exception:
       pass
     print("init_hw")
+    if getenv("NV_SNAPSHOT", 0): self.nvdev.gsp.debug_snapshot("cot_post_lockdown")
 
 
   def kfsp_send_msg(self, nvmd:int, buf:bytes):
@@ -412,19 +419,68 @@ class NV_GSP(NV_IP):
     except Exception:
       active = None
     try:
+      halted = self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(self.nvdev.flcn.falcon).read_bitfields().get('halted', None)
+    except Exception:
+      halted = None
+    try:
       stat_tx_entry_off = nv.msgqTxHeader.from_address(self.stat_q_va).entryOff
     except Exception:
       stat_tx_entry_off = None
 
-    print(f"FW State: lockdown={lockdown}, riscv_active={active}, stat_entryOff={stat_tx_entry_off}")
+    print(f"FW State: lockdown={lockdown}, riscv_active={active}, falcon_halted={halted}, stat_entryOff={stat_tx_entry_off}")
 
     # Heuristic readiness estimation
     ready_cot = (lockdown == 0)
-    ready_core = (active == 1)
+    # Consider either RISCV active==1 or Falcon not halted==0 as core running
+    ready_core = (active == 1) or (halted == 0 if halted is not None else False)
     ready_queue = (stat_tx_entry_off == 0x1000)
     overall = ready_cot and ready_core and ready_queue
     print(f"FW Ready? cot={ready_cot}, core={ready_core}, queue={ready_queue} -> {overall}")
     return overall
+  def debug_snapshot(self, tag: str = ""):
+    def safe_read(fn, desc: str):
+      try:
+        val = fn()
+        print(f"SNAP[{tag}] {desc}: {val}")
+      except Exception as e:
+        print(f"SNAP[{tag}] {desc}: <err {e}>")
+
+    print(f"SNAP[{tag}] ===== NV_GSP Snapshot =====")
+    # BARs
+    try:
+      print(f"SNAP[{tag}] BARs: {self.nvdev.bars}")
+    except Exception as e:
+      print(f"SNAP[{tag}] BARs: <err {e}>")
+
+    # Queue headers (if allocated)
+    if hasattr(self, 'cmd_q_va'):
+      safe_read(lambda: nv.msgqTxHeader.from_address(self.cmd_q_va).entryOff, "CMD_TX.entryOff")
+      safe_read(lambda: nv.msgqTxHeader.from_address(self.cmd_q_va).msgSize, "CMD_TX.msgSize")
+      safe_read(lambda: nv.msgqTxHeader.from_address(self.cmd_q_va).msgCount, "CMD_TX.msgCount")
+    if hasattr(self, 'stat_q_va'):
+      safe_read(lambda: nv.msgqTxHeader.from_address(self.stat_q_va).entryOff, "STAT_TX.entryOff")
+      safe_read(lambda: nv.msgqTxHeader.from_address(self.stat_q_va).msgSize, "STAT_TX.msgSize")
+      safe_read(lambda: nv.msgqTxHeader.from_address(self.stat_q_va).msgCount, "STAT_TX.msgCount")
+
+    # Doorbells and message queues
+    safe_read(lambda: self.nvdev.NV_PGSP_QUEUE_HEAD[0].read(), "PGSP_QUEUE_HEAD")
+    safe_read(lambda: self.nvdev.NV_PGSP_QUEUE_TAIL[0].read(), "PGSP_QUEUE_TAIL")
+    if hasattr(self.nvdev, 'NV_PFSP_MSGQ_HEAD') and hasattr(self.nvdev, 'NV_PFSP_MSGQ_TAIL'):
+      safe_read(lambda: self.nvdev.NV_PFSP_MSGQ_HEAD[0].read(), "PFSP_MSGQ_HEAD")
+      safe_read(lambda: self.nvdev.NV_PFSP_MSGQ_TAIL[0].read(), "PFSP_MSGQ_TAIL")
+
+    # Falcon/GSP state
+    safe_read(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.nvdev.flcn.falcon).read_bitfields().get('mem_scrubbing', None), "HWCFG2.mem_scrubbing")
+    safe_read(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.nvdev.flcn.falcon).read_bitfields().get('riscv_br_priv_lockdown', None), "HWCFG2.riscv_br_priv_lockdown")
+    safe_read(lambda: self.nvdev.NV_PRISCV_RISCV_CPUCTL.with_base(self.nvdev.flcn.falcon).read_bitfields().get('active_stat', None), "RISCV.active_stat")
+    safe_read(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(self.nvdev.flcn.falcon).read_bitfields().get('halted', None), "FALCON.halted")
+
+    # Mailboxes
+    safe_read(lambda: self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(self.nvdev.flcn.falcon).read(), "FALCON.MAILBOX0")
+    safe_read(lambda: self.nvdev.NV_PFALCON_FALCON_MAILBOX1.with_base(self.nvdev.flcn.falcon).read(), "FALCON.MAILBOX1")
+    safe_read(lambda: self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(self.nvdev.flcn.sec2).read(), "SEC2.MAILBOX0")
+    safe_read(lambda: self.nvdev.NV_PFALCON_FALCON_MAILBOX1.with_base(self.nvdev.flcn.sec2).read(), "SEC2.MAILBOX1")
+    print(f"SNAP[{tag}] ==========================")
   def init_sw(self):
     if DEBUG >= 1:
       print("NV_GSP.init_sw: allocate RPC queues, build radix-3 image/signature and boot binary, setup libOS/log buffers")
@@ -436,6 +492,7 @@ class NV_GSP(NV_IP):
     # Prefill cmd queue with info for gsp to start.
     self.rpc_set_gsp_system_info()
     self.rpc_set_registry_table()
+    if getenv("NV_SNAPSHOT", 0): self.debug_snapshot("gsp_after_init_sw")
 
     self.gpfifo_class, self.compute_class, self.dma_class = nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_COMPUTE_B, nv_gpu.AMPERE_DMA_COPY_B
     match self.nvdev.chip_name[:2]:
@@ -459,6 +516,12 @@ class NV_GSP(NV_IP):
     self.pt_size = pt_size
 
     # Fill up ptes
+    if DEBUG >= 1:
+      print(f"MSGQ PT: pte_cnt={pte_cnt}, pt_size={pt_size}, total_pages={len(queues_sysmem)}")
+      for i in range(min(8, len(queues_sysmem))):
+        print(f"  PTE[{i}] = 0x{queues_sysmem[i]:x}")
+      if len(queues_sysmem) > 8:
+        print(f"  ... {len(queues_sysmem)-8} more PTEs")
     for i, sysmem in enumerate(queues_sysmem): to_mv(queues_va + i * 0x8, 0x8).cast('Q')[0] = sysmem
 
     # Fill up arguments
@@ -509,15 +572,27 @@ class NV_GSP(NV_IP):
     for i in range(3, 0, -1): npages[i-1] = ((npages[i] - 1) >> (nv.LIBOS_MEMORY_REGION_RADIX_PAGE_LOG2 - 3)) + 1
 
     offsets = [sum(npages[:i]) * 0x1000 for i in range(4)]
+    # Prefill image during allocation to avoid a separate memcpy
+    # Layout: [radix tables zeroed] + [image] + [tail padding to 4K if needed]
+    tail_pad = (npages[3] * 0x1000) - len(self.gsp_image)
+    prefill = (b"\x00" * offsets[-1]) + self.gsp_image + (b"\x00" * tail_pad)
+    print(f"GSP_IMAGE: len={len(self.gsp_image)}")
+    print(f"prefill: len={len(prefill)}")
     radix_va, self.gsp_radix3_sysmem = System.alloc_sysmem(
-      offsets[-1] + len(self.gsp_image),
+      len(prefill),
       contiguous=False,
+      data=prefill,
       direction=System.DMA_DIRECTION_CPU_TO_GPU,
       name="GSP_RADIX3_IMAGE_AND_PT"
     )
+    if DEBUG >= 1:
+      print(f"RADIX3: levels pages={npages}, total_pages={len(self.gsp_radix3_sysmem)}")
+      for i in range(min(8, len(self.gsp_radix3_sysmem))):
+        print(f"  R3[{i}] IOVA=0x{self.gsp_radix3_sysmem[i]:x}")
+      if len(self.gsp_radix3_sysmem) > 8:
+        print(f"  ... {len(self.gsp_radix3_sysmem)-8} more radix pages")
 
-    # Copy image
-    to_mv(radix_va + offsets[-1], len(self.gsp_image))[:] = self.gsp_image
+    # Image is already placed at radix_va + offsets[-1]
 
     # Copy level and image pages.
     for i in range(0, 3):
@@ -640,10 +715,14 @@ class NV_GSP(NV_IP):
       pass
 
     # Upstream sequence: create status queue and immediately wait for INIT_DONE
+    if getenv("NV_SNAPSHOT", 0): self.debug_snapshot("gsp_pre_stat")
     self.stat_q = NVRpcQueue(self, self.stat_q_va, self.cmd_q_va)
+    if getenv("NV_SNAPSHOT", 0): self.debug_snapshot("gsp_post_stat_create")
     self.cmd_q.rx = nv.msgqRxHeader.from_address(self.stat_q.va + self.stat_q.tx.rxHdrOff)
 
+    self.debug_firmware_state()
     self.stat_q.wait_resp(nv.NV_VGPU_MSG_EVENT_GSP_INIT_DONE)
+    if getenv("NV_SNAPSHOT", 0): self.debug_snapshot("gsp_after_init_done")
 
     self.nvdev.NV_PBUS_BAR1_BLOCK.write(mode=0, target=0, ptr=0)
     if self.nvdev.fmc_boot: self.nvdev.NV_VIRTUAL_FUNCTION_PRIV_FUNC_BAR1_BLOCK_LOW_ADDR.write(mode=0, target=0, ptr=0)

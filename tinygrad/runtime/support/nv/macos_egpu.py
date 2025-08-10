@@ -1,10 +1,16 @@
 from __future__ import annotations
 import os, struct
-from ctypes import CDLL, c_void_p, c_int, c_uint64, c_uint32, c_uint16, POINTER, Structure, byref
+from ctypes import CDLL, c_void_p, c_int, c_uint64, c_uint32, c_uint16, POINTER, Structure, byref, c_char_p, create_string_buffer, cast
 from tinygrad.helpers import getenv, DEBUG
 from tinygrad.runtime.support.hcq import MMIOInterface
 
 NV_DEBUG = getenv("NV_DEBUG", 0)
+
+# DMA on macOS (DriverKit/Apple‑silicon) quick notes:
+# - Device DMA uses IOVA (IOMMU/DART). Do not program CPU virtual or host physical addresses into HW.
+# - The driver returns IOVA segments. Use those for hardware, and use the returned virtual address only for memcpy.
+# - max_pairs controls how many scatter/gather entries you request; actual returned count may be less.
+# - segment_count is the number of IOVA segments returned; iova_4k_pages is total 4K pages across all segments.
 
 # Optional path override via env
 LIBEGPU_PATH = os.path.expanduser(os.environ.get('LIBEGPU_PATH', '~/SourceRelease/GITHUB/eGPU/eGPU/EGPUMapperDriver/libegpu_pcidevice.dylib'))
@@ -61,12 +67,48 @@ if libegpu is not None:
   # DMA APIs
   libegpu.egpu_device_allocate_dma_buffer.restype = c_uint64
   libegpu.egpu_device_allocate_dma_buffer.argtypes = [c_void_p, c_uint64, c_uint32, POINTER(c_uint64), POINTER(c_uint64)]
+  # with-data variant (contiguous): returns handle (uint64), fills phys/virt via out ptrs
+  try:
+    libegpu.egpu_device_allocate_dma_buffer_with_data
+    libegpu.egpu_device_allocate_dma_buffer_with_data.restype = c_uint64
+    # args: device, size, direction, data_ptr, data_len, out_phys, out_virt
+    libegpu.egpu_device_allocate_dma_buffer_with_data.argtypes = [
+      c_void_p, c_uint64, c_uint32, c_void_p, c_uint64, POINTER(c_uint64), POINTER(c_uint64)
+    ]
+  except AttributeError:
+    pass
   libegpu.egpu_device_destroy_dma_buffer.restype = c_int
   libegpu.egpu_device_destroy_dma_buffer.argtypes = [c_void_p, c_uint64]
   libegpu.egpu_device_get_memory_type_for_handle.restype = c_uint32
   libegpu.egpu_device_get_memory_type_for_handle.argtypes = [c_void_p, c_uint64]
   libegpu.egpu_device_copy_dma_buffers.restype = c_int
   libegpu.egpu_device_copy_dma_buffers.argtypes = [c_void_p, c_uint64, c_uint64, c_uint64, c_uint64]
+  # Segmented DMA allocation API (returns count, handle, virtual, then pairs)
+  # C++ signature:
+  # bool allocate_dma_buffer_segmented(uint64_t size, uint32_t direction, uint32_t max_pairs,
+  #                                    uint32_t* out_count, std::vector<pair<uint64_t,uint64_t>>& out_segments,
+  #                                    uint64_t* handle, uint64_t* virtual_addr)
+  try:
+    libegpu.egpu_device_allocate_dma_buffer_segmented
+    libegpu.egpu_device_allocate_dma_buffer_segmented.restype = c_int
+    # args: device, size, direction, max_pairs, out_count, out_addrs, out_lens, out_handle, out_virtual
+    libegpu.egpu_device_allocate_dma_buffer_segmented.argtypes = [c_void_p, c_uint64, c_uint32, c_uint32,
+                                                                  POINTER(c_uint32), POINTER(c_uint64), POINTER(c_uint64),
+                                                                  POINTER(c_uint64), POINTER(c_uint64)]
+  except AttributeError:
+    pass
+
+  # With-data DMA allocation APIs (segmented): status return, fills outputs
+  try:
+    libegpu.egpu_device_allocate_dma_buffer_segmented_with_data
+    libegpu.egpu_device_allocate_dma_buffer_segmented_with_data.restype = c_int
+    # args: device, size, direction, data_ptr, data_len, max_pairs, out_count, out_addrs, out_lens, out_handle, out_virtual
+    libegpu.egpu_device_allocate_dma_buffer_segmented_with_data.argtypes = [
+      c_void_p, c_uint64, c_uint32, c_void_p, c_uint64, c_uint32,
+      POINTER(c_uint32), POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64)
+    ]
+  except AttributeError:
+    pass
 
 class EGPUMMIOInterface(MMIOInterface):
   def __init__(self, device_handle: c_void_p, bar_index: int, fmt: str = 'I', base_offset: int = 0, size_bytes: int | None = None):
@@ -213,9 +255,138 @@ class MacOSEGPUDevice:
     return int(libegpu.egpu_device_get_connection(self.handle))
 
   def allocate_dma_buffer(self, size: int, direction: int) -> dict:
+    """
+    Allocate a DMA buffer (single segment expected) and return:
+      - handle: opaque buffer handle
+      - size: requested size
+      - physical_addr: device DMA address (IOVA) to program into hardware
+      - virtual_addr: CPU pointer in the driver process (diagnostic); for memcpy in user space,
+                      map the buffer with IOConnectMapMemory using handle/memory type.
+    Notes:
+      - On macOS DriverKit/Apple‑silicon, physical_addr here is an IOVA, not host physical or CPU virtual.
+      - If a single segment cannot be guaranteed, use allocate_dma_buffer_segmented.
+    """
     phys = c_uint64(0); virt = c_uint64(0)
     h = int(libegpu.egpu_device_allocate_dma_buffer(self.handle, c_uint64(size), c_uint32(direction), byref(phys), byref(virt)))
     return {'handle': h, 'size': size, 'physical_addr': int(phys.value), 'virtual_addr': int(virt.value)} if h != 0 else None
+
+  def allocate_dma_buffer_with_data(self, data: bytes, direction: int) -> dict | None:
+    """
+    Allocate a DMA buffer sized to len(data), prefill it with the given bytes, and return the same
+    fields as allocate_dma_buffer. Fallbacks are layered to try best-effort prefilling:
+      1) Use direct with-data contiguous allocation if exported by the dylib.
+      2) If unavailable, allocate a segmented-with-data staging buffer, allocate a final contiguous buffer,
+         copy the bytes using the driver's copy API, and free the staging buffer.
+      3) As a last resort, allocate without prefilling and return the buffer; caller must write the data.
+    """
+    size = len(data)
+
+    # 1) Preferred: direct contiguous with-data API (current dylib signature)
+    if hasattr(libegpu, 'egpu_device_allocate_dma_buffer_with_data'):
+      phys = c_uint64(0)
+      virt = c_uint64(0)
+      # Prepare a stable buffer for the duration of the call and pass as void*
+      buf = create_string_buffer(data)
+      h = int(libegpu.egpu_device_allocate_dma_buffer_with_data(
+        self.handle, c_uint64(size), c_uint32(direction), cast(buf, c_void_p), c_uint64(size), byref(phys), byref(virt)
+     ))
+      if h != 0:
+        return {'handle': int(h), 'size': size, 'physical_addr': int(phys.value), 'virtual_addr': int(virt.value)}
+      # Fall through to staged/last-resort if the call fails
+
+    # 2) Fallback: staged segmented-with-data + copy into a final contiguous buffer
+    if hasattr(libegpu, 'egpu_device_allocate_dma_buffer_segmented_with_data'):
+      staged = self.allocate_dma_buffer_segmented_with_data(data, direction)
+      if staged is not None:
+        final = self.allocate_dma_buffer(size, direction)
+        if final is None:
+          # Cleanup staged before returning
+          self.destroy_dma_buffer(staged['handle'])
+          return None
+        # Copy data and free staging buffer regardless of copy success
+        copied = self.copy_dma_buffers(staged['handle'], final['handle'], 0, size)
+        self.destroy_dma_buffer(staged['handle'])
+        if not copied:
+          self.destroy_dma_buffer(final['handle'])
+          return None
+        # Ensure size is set (allocate_dma_buffer already includes phys/virt)
+        final['size'] = size
+        return final
+
+    # 3) Last resort: allocate without prefilling; caller must write the bytes
+    return self.allocate_dma_buffer(size, direction)
+
+  def allocate_dma_buffer_segmented(self, size: int, direction: int, max_pairs: int = 32):
+    """
+    Allocate a DMA buffer and return scatter/gather segments.
+    - Responsibility: caller chooses max_pairs; this function allocates buffers for up to max_pairs
+      and forwards the request to the driver. The driver returns up to that many segments (or fewer).
+    - Returns None on failure or dict with:
+        - handle: buffer handle (opaque)
+        - virtual_addr: CPU pointer in the driver task (diagnostic). For memcpy in user space, map the buffer
+                        via IOConnectMapMemory using the handle/memory type returned elsewhere in the API.
+        - segments: list[(dma_iova, length)] for device programming
+        - segment_count: number of IOVA segments returned (scatter/gather entries)
+        - pages: alias of segment_count for compatibility with code that equates "pages" with segments
+        - iova_4k_pages: total 4K pages across all segments (ceil(sum(length)/4096))
+    Notes:
+      - Program the device with segment dma_iova values (IOVA), not the CPU pointer.
+    """
+    # Fallback if symbol not present
+    if not hasattr(libegpu, 'egpu_device_allocate_dma_buffer_segmented'):
+      single = self.allocate_dma_buffer(size, direction)
+      if not single: return None
+      return {'handle': single['handle'], 'virtual_addr': single['virtual_addr'], 'segments': [(single['physical_addr'], size)]}
+
+    out_count = c_uint32(0)
+    handle = c_uint64(0)
+    virt = c_uint64(0)
+    addrs = (c_uint64 * max_pairs)()
+    lens  = (c_uint64 * max_pairs)()
+
+    ok = int(libegpu.egpu_device_allocate_dma_buffer_segmented(self.handle, c_uint64(size), c_uint32(direction), c_uint32(max_pairs),
+                                                               byref(out_count), addrs, lens, byref(handle), byref(virt)))
+    if ok != 1: return None
+
+    segs = [(int(addrs[i]), int(lens[i])) for i in range(int(out_count.value))]
+    total_len = sum(l for _, l in segs)
+    iova_4k_pages = (total_len + 4095) // 4096
+    segment_count = len(segs)
+    return {
+      'handle': int(handle.value),
+      'virtual_addr': int(virt.value),
+      'segments': segs,
+      'segment_count': segment_count,
+      'pages': segment_count,                # compatibility: some code treats "pages" == segments
+      'iova_4k_pages': int(iova_4k_pages),   # actual total 4K pages across segments
+    }
+
+  def allocate_dma_buffer_segmented_with_data(self, data: bytes, direction: int, max_pairs: int = 32):
+    if not hasattr(libegpu, 'egpu_device_allocate_dma_buffer_segmented_with_data'):
+      return None
+    out_count = c_uint32(0)
+    handle = c_uint64(0)
+    virt = c_uint64(0)
+    addrs = (c_uint64 * max_pairs)()
+    lens  = (c_uint64 * max_pairs)()
+    buf = create_string_buffer(data)
+    ok = int(libegpu.egpu_device_allocate_dma_buffer_segmented_with_data(
+      self.handle, c_uint64(len(data)), c_uint32(direction), cast(buf, c_void_p), c_uint64(len(data)), c_uint32(max_pairs),
+      byref(out_count), addrs, lens, byref(handle), byref(virt)
+    ))
+    if ok != 1: return None
+    segs = [(int(addrs[i]), int(lens[i])) for i in range(int(out_count.value))]
+    total_len = sum(l for _, l in segs)
+    iova_4k_pages = (total_len + 4095) // 4096
+    return {
+      'handle': int(handle.value),
+      'virtual_addr': int(virt.value),
+      'segments': segs,
+      'segment_count': len(segs),
+      'iova_4k_pages': int(iova_4k_pages),
+    }
+
+  # (note) second duplicate definition removed; the implementation above is the authoritative version
 
   def destroy_dma_buffer(self, handle: int) -> bool:
     return int(libegpu.egpu_device_destroy_dma_buffer(self.handle, c_uint64(handle))) == 1

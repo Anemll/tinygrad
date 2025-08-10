@@ -156,6 +156,7 @@ class NVDev(PCIDevImplBase):
   def _alloc_boot_struct(self, struct:ctypes.Structure) -> tuple[ctypes.Structure, int]:
     va, paddrs = System.alloc_sysmem(
       sz:=ctypes.sizeof(type(struct)),
+      data=bytes(struct),
       contiguous=True,
       direction=System.DMA_DIRECTION_CPU_TO_GPU,
       name=f"BOOT_STRUCT_{type(struct).__name__}"

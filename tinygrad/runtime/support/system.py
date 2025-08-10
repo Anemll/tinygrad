@@ -79,12 +79,43 @@ class _System:
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False, data:bytes|None=None, direction:int=DMA_DIRECTION_CPU_TO_GPU, name:str|None=None) -> tuple[int, list[int]]:
     if OSX:
+      # Debug: Print all parameters for alloc_sysmem call on macOS
+      print(f"[alloc_sysmem] Callin: alloc_sysmem( name={name}  size={size}, vaddr={vaddr}, contiguous={contiguous}, data={'present' if data is not None else 'None'}, direction={direction})")
       # Use DriverKit DMA allocation on macOS via macos_egpu provider
       from tinygrad.runtime.support.nv.macos_egpu import acquire_device
       dev = acquire_device(0)
 
-      # Allocate DMA buffer using provider
-      buffer_info = dev.allocate_dma_buffer(size, direction)
+      # Allocate DMA buffer using provider. Prefer segmented for non-contiguous allocations
+      use_segmented = not contiguous
+      if use_segmented and hasattr(dev, 'allocate_dma_buffer_segmented'):
+        max_pairs = max(1, (size + 4095) // 4096)
+        # Prefer with-data path to ensure driver-side buffer init if data provided (any direction)
+        if data is not None and hasattr(dev, 'allocate_dma_buffer_segmented_with_data'):
+          seg = dev.allocate_dma_buffer_segmented_with_data(data, direction, max_pairs=max_pairs)
+        else:
+          seg = dev.allocate_dma_buffer_segmented(size, direction, max_pairs=max_pairs)
+        if seg is None:
+          # Fallback
+          if data is not None and hasattr(dev, 'allocate_dma_buffer_with_data'):
+            single = dev.allocate_dma_buffer_with_data(data, direction)
+            buffer_info = single if single is not None else dev.allocate_dma_buffer(size, direction)
+          else:
+            buffer_info = dev.allocate_dma_buffer(size, direction)
+          use_segmented = False
+        else:
+          buffer_info = {
+            'handle': seg['handle'],
+            'size': size,
+            'physical_addr': seg['segments'][0][0] if seg['segments'] else 0,
+            'virtual_addr': seg['virtual_addr'],
+            'segments': seg['segments'],
+          }
+      else:
+        if data is not None and hasattr(dev, 'allocate_dma_buffer_with_data'):
+          single = dev.allocate_dma_buffer_with_data(data, direction)
+          buffer_info = single if single is not None else dev.allocate_dma_buffer(size, direction)
+        else:
+          buffer_info = dev.allocate_dma_buffer(size, direction)
       if not buffer_info:
         raise RuntimeError(f"Failed to allocate DMA buffer of size {size}")
       
@@ -100,18 +131,27 @@ class _System:
       default_name = name or f"DMA_{dir_str}_{buffer_info['size']}"
       buffer_info['name'] = default_name
 
-      print(
-        f"✅ DMA buffer allocated: handle=0x{buffer_info['handle']:x}, memoryType={memory_type}, "
-        f"physical=0x{buffer_info['physical_addr']:x}, virtual=0x{buffer_info['virtual_addr']:x}, "
-        f"size={buffer_info['size']}, direction={dir_str}, name='{default_name}'"
-      )
+      if use_segmented:
+        seg_cnt = len(buffer_info.get('segments', []))
+        total_pages = sum((ln + 4095)//4096 for _, ln in buffer_info.get('segments', []))
+        print(
+          f"✅ DMA buffer (segmented) allocated: handle=0x{buffer_info['handle']:x}, memoryType={memory_type}, "
+          f"segments={seg_cnt}, total_pages={total_pages}, first_iova=0x{buffer_info['physical_addr']:x}, "
+          f"virtual=0x{buffer_info['virtual_addr']:x}, size={buffer_info['size']}, direction={dir_str}, name='{default_name}'"
+        )
+      else:
+        print(
+          f"✅ DMA buffer allocated: handle=0x{buffer_info['handle']:x}, memoryType={memory_type}, "
+          f"physical=0x{buffer_info['physical_addr']:x}, virtual=0x{buffer_info['virtual_addr']:x}, "
+          f"size={buffer_info['size']}, direction={dir_str}, name='{default_name}'"
+        )
       
       # Step 2: Get IOKit connection handle
       connection = dev.get_connection()
       if not connection:
         raise RuntimeError("Failed to get IOKit connection handle")
       
-      # Step 3: Map to user space with IOConnectMapMemory
+      # Step 3: Map to user space with IOConnectMapMemory (always map; we will memcpy if data is provided)
       import ctypes
       IOKit = ctypes.CDLL('/System/Library/Frameworks/IOKit.framework/IOKit')
       
@@ -189,10 +229,21 @@ class _System:
       )
       
       # Return compatible format: (real_virtual_addr, [physical_addresses])
-      # For compatibility with Linux, expand single physical address into page addresses
-      page_size = 4096  # Standard page size
-      num_pages = (buffer_info['size'] + page_size - 1) // page_size
-      physical_pages = [buffer_info['physical_addr'] + i * page_size for i in range(num_pages)]
+      # If segmented, expand segments to page list; else expand single base
+      if use_segmented and buffer_info.get('segments'):
+        physical_pages: list[int] = []
+        print("🧩 Segmented DMA segments (VA base -> IOVA base, length):")
+        va_cursor = real_virtual_addr
+        for idx, (base, length) in enumerate(buffer_info['segments']):
+          print(f"   - seg[{idx}]: VA=0x{va_cursor:x} -> IOVA=0x{base:x}, len={length}")
+          for off in range(0, length, 4096):
+            physical_pages.append(base + off)
+          va_cursor += length
+        print(f"🧩 Segmented DMA: using {len(buffer_info['segments'])} segments -> {len(physical_pages)} pages")
+      else:
+        page_size = 4096  # Standard page size
+        num_pages = (buffer_info['size'] + page_size - 1) // page_size
+        physical_pages = [buffer_info['physical_addr'] + i * page_size for i in range(num_pages)]
       
       return real_virtual_addr, physical_pages
     
