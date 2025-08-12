@@ -76,13 +76,19 @@ class NVDev(PCIDevImplBase):
     self.lock_fd = System.flock_acquire(f"nv_{self.devfmt}.lock")
     
     # Debug BAR sizes for firmware comparison
-    print(f"DEBUG: Available BARs for firmware loading:")
+    print(f"🐧 DEBUG: Available BARs for firmware loading:")
     for bar_num, (start, end, flags) in bars.items():
       size = end - start + 1
       print(f"  BAR {bar_num}: {size} bytes ({size/(1024*1024):.1f} MB) at 0x{start:x}")
 
     self.smi_dev, self.is_booting = False, True
     self._early_init()
+
+    # Dump PCI config space early on Linux for baseline comparison
+    try:
+      self.dump_pci_config()
+    except Exception as e:
+      if DEBUG: print(f"DEBUG: dump_pci_config failed: {e}")
 
     # UVM depth   HW level                            VA bits
     # 0           PDE4                                56:56 (hopper+)
@@ -122,14 +128,14 @@ class NVDev(PCIDevImplBase):
     original_chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
     self.chip_name = original_chip_name
     if self.chip_name == "GB205": 
-      print(f"DEBUG: RTX 5070 detected - mapping chip {original_chip_name} → GB202 for compatibility")
+      print(f"🐧 DEBUG: RTX 5070 detected - mapping chip {original_chip_name} → GB202 for compatibility")
       self.chip_name = "GB202" # for testing
-    print(f"DEBUG: Using chip name: {self.chip_name} (original: {original_chip_name})")
+    print(f"🐧 DEBUG: Using chip name: {self.chip_name} (original: {original_chip_name})")
     self.mmu_ver, self.fmc_boot = (3, True) if self.chip_details['architecture'] >= 0x1a else (2, False)
 
     self.include("src/common/inc/swref/published/turing/tu102/dev_fb.h")
     if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
-      if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.")
+      if DEBUG >= 2: print(f"🐧 nv {self.devfmt}: WPR2 is up. Issuing a full reset.")
       System.pci_reset(self.devfmt)
       time.sleep(0.5)
 
@@ -153,9 +159,23 @@ class NVDev(PCIDevImplBase):
   def _download(self, file:str) -> str:
     url = f"https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/{file}"
     chip_name = getattr(self, 'chip_name', 'unknown')
-    print(f"DEBUG: Downloading {file} using chip_name={chip_name}")
-    print(f"DEBUG: URL: {url}")
+    print(f"🐧 DEBUG: Downloading {file} using chip_name={chip_name}")
+    print(f"🐧 DEBUG: URL: {url}")
     return fetch(url, subdir="defines").read_text()
+
+  def dump_pci_config(self):
+    """Dump first 256 bytes of PCI config space (DW aligned)"""
+    try:
+      config = {}
+      for off in range(0, 0x100, 4):
+        try:
+          val = self.read_config(off, 4)
+        except Exception:
+          val = 0
+        config[hex(off)] = hex(val)
+      print(f"🔍 PCI Config Dump (Linux): {config}")
+    except Exception as e:
+      print(f"🐧 DEBUG: PCI config dump error: {e}")
 
   def extract_fw(self, file:str, dname:str) -> bytes:
     # Extracts the firmware binary from the given header
@@ -164,7 +184,7 @@ class NVDev(PCIDevImplBase):
     info, sl = text[text[:text.index(dnm:=f'{file}_{self.chip_name}_{dname}')].rindex("COMPRESSION:"):][:16], text[text.index(dnm) + len(dnm) + 7:]
     image = bytes.fromhex(sl[:sl.find("};")].strip().replace("0x", "").replace(",", "").replace(" ", "").replace("\n", ""))
     fw_data = gzip.decompress(struct.pack("<4BL2B", 0x1f, 0x8b, 8, 0, 0, 0, 3) + image) if "COMPRESSION: YES" in info else image
-    print(f"DEBUG: Extracted firmware {file}:{dname} - size: {len(fw_data)} bytes ({len(fw_data)/(1024*1024):.1f} MB)")
+    print(f"🐧 DEBUG: Extracted firmware {file}:{dname} - size: {len(fw_data)} bytes ({len(fw_data)/(1024*1024):.1f} MB)")
     return fw_data
 
   def include(self, file:str):

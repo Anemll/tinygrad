@@ -1,8 +1,31 @@
 from __future__ import annotations
-import ctypes, time, array, struct, itertools, dataclasses
+import ctypes, time, array, struct, itertools, dataclasses, functools, types
 from typing import cast, Any
 from tinygrad.runtime.autogen.nv import nv
 from tinygrad.helpers import to_mv, lo32, hi32, DEBUG, round_up, round_down, mv_address, fetch, wait_cond
+
+# --- Debug tracing utility ---
+def _trace_call(func):
+  @functools.wraps(func)
+  def wrapper(*args, **kwargs):
+    if DEBUG > 1:
+      try:
+        print(func.__qualname__)
+      except Exception:
+        print(getattr(func, '__name__', 'function'))
+    return func(*args, **kwargs)
+  return wrapper
+
+def trace_methods(cls):
+  for name, attr in list(cls.__dict__.items()):
+    if name.startswith('__') and name.endswith('__'): continue
+    if isinstance(attr, staticmethod):
+      setattr(cls, name, staticmethod(_trace_call(attr.__func__)))
+    elif isinstance(attr, classmethod):
+      setattr(cls, name, classmethod(_trace_call(attr.__func__)))
+    elif callable(attr):
+      setattr(cls, name, _trace_call(attr))
+  return cls
 from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.autogen import nv_gpu
@@ -10,12 +33,14 @@ from tinygrad.runtime.autogen import nv_gpu
 @dataclasses.dataclass(frozen=True)
 class GRBufDesc: size:int; virt:bool; phys:bool; local:bool=False # noqa: E702
 
+@trace_methods
 class NV_IP:
   def __init__(self, nvdev): self.nvdev = nvdev
   def init_sw(self): pass # Prepare sw/allocations for this IP
   def init_hw(self): pass # Initialize hw for this IP
   def fini_hw(self): pass # Finalize hw for this IP
 
+@trace_methods
 class NVRpcQueue:
   def __init__(self, gsp:NV_GSP, va:int, completion_q_va:int|None=None):
     self.tx = nv.msgqTxHeader.from_address(va)
@@ -71,9 +96,16 @@ class NVRpcQueue:
         rpc_names = {**nv.c__Ea_NV_VGPU_MSG_FUNCTION_NOP__enumvalues, **nv.c__Ea_NV_VGPU_MSG_EVENT_FIRST_EVENT__enumvalues}
         print(f"nv {self.gsp.nvdev.devfmt}: in RPC: {rpc_names.get(hdr.function, f'ev:{hdr.function:x}')}, res:{hdr.rpc_result:#x}")
 
+      # Debug register snapshot on every response
+      self.gsp.dump_gsp_regs()
+
       if hdr.rpc_result != 0: raise RuntimeError(f"RPC call {hdr.function} failed with result {hdr.rpc_result}")
+      if hdr.rpc_result != 0:
+        # Extra dump on error for parity with macOS logging
+        self.gsp.dump_gsp_regs()
       if hdr.function == cmd: return msg
 
+@trace_methods
 class NV_FLCN(NV_IP):
   def init_sw(self):
     self.nvdev.include("src/common/inc/swref/published/ampere/ga102/dev_gsp.h")
@@ -149,7 +181,7 @@ class NV_FLCN(NV_IP):
 
     patched_image = bytearray(image)
     patched_image[patch_loc:patch_loc+sig_len] = sig[:sig_len]
-    self.booter_image_va, self.booter_image_sysmem = System.alloc_sysmem(len(patched_image), contiguous=True, data=patched_image)
+    self.booter_image_va, self.booter_image_sysmem = System.alloc_sysmem(len(patched_image), contiguous=True, data=patched_image, name="BOOTER_UCODE_IMAGE")
     _, _, self.booter_data_off, self.booter_data_sz, _, self.booter_code_off, self.booter_code_sz, _, _ = struct.unpack("9I", header)
 
   def init_hw(self):
@@ -251,6 +283,7 @@ class NV_FLCN(NV_IP):
       wait_cond(lambda: self.nvdev.NV_PRISCV_RISCV_BCR_CTRL.with_base(base).read_bitfields()['valid'], msg="RISCV core not booted")
       self.nvdev.NV_PFALCON_FALCON_RM.with_base(base).write(self.nvdev.chip_id)
 
+@trace_methods
 class NV_FLCN_COT(NV_IP):
   def init_sw(self):
     self.nvdev.include("src/common/inc/swref/published/ampere/ga102/dev_gsp.h")
@@ -269,7 +302,7 @@ class NV_FLCN_COT(NV_IP):
     self.fmc_booter_hash = memoryview(self.nvdev.extract_fw("kgspBinArchiveGspRmFmcGfwProdSigned", "ucode_hash_data")).cast('I')
     self.fmc_booter_sig = memoryview(self.nvdev.extract_fw("kgspBinArchiveGspRmFmcGfwProdSigned", "ucode_sig_data")).cast('I')
     self.fmc_booter_pkey = memoryview(self.nvdev.extract_fw("kgspBinArchiveGspRmFmcGfwProdSigned", "ucode_pkey_data") + b'\x00\x00\x00').cast('I')
-    _, self.fmc_booter_sysmem = System.alloc_sysmem(len(self.fmc_booter_image), contiguous=True, data=self.fmc_booter_image)
+    _, self.fmc_booter_sysmem = System.alloc_sysmem(len(self.fmc_booter_image), contiguous=True, data=self.fmc_booter_image, name="FMC_BOOTER_UCODE_IMAGE")
 
   def init_hw(self):
     self.falcon = 0x00110000
@@ -286,6 +319,59 @@ class NV_FLCN_COT(NV_IP):
 
     self.kfsp_send_msg(nv.NVDM_TYPE_COT, bytes(cot_payload))
     wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read_bitfields()['riscv_br_priv_lockdown'], value=0)
+
+  def dump_gsp_regs(self):
+    """Dump GSP/FSP registers for debugging"""
+    try:
+      regs: dict[str, str] = {}
+
+      # PGSP mailbox/queue
+      try:
+        regs["PGSP_MAILBOX0"] = hex(self.nvdev.NV_PGSP_FALCON_MAILBOX0.read())
+        regs["PGSP_MAILBOX1"] = hex(self.nvdev.NV_PGSP_FALCON_MAILBOX1.read())
+      except Exception:
+        pass
+      try:
+        regs["PGSP_QUEUE_HEAD"] = hex(self.nvdev.NV_PGSP_QUEUE_HEAD[0].read())
+      except Exception:
+        pass
+      try:
+        regs["PGSP_QUEUE_TAIL"] = hex(self.nvdev.NV_PGSP_QUEUE_TAIL[0].read())
+      except Exception:
+        pass
+
+      # PFSP queue/msgq
+      try:
+        regs["PFSP_QUEUE_HEAD"] = hex(self.nvdev.NV_PFSP_QUEUE_HEAD[0].read())
+      except Exception:
+        pass
+      try:
+        regs["PFSP_QUEUE_TAIL"] = hex(self.nvdev.NV_PFSP_QUEUE_TAIL[0].read())
+      except Exception:
+        pass
+      try:
+        regs["PFSP_MSGQ_HEAD"] = hex(self.nvdev.NV_PFSP_MSGQ_HEAD[0].read())
+      except Exception:
+        pass
+      try:
+        regs["PFSP_MSGQ_TAIL"] = hex(self.nvdev.NV_PFSP_MSGQ_TAIL[0].read())
+      except Exception:
+        pass
+
+      # PMC boot and falcon cfg
+      try:
+        regs["PMC_BOOT_0"] = hex(self.nvdev.NV_PMC_BOOT_0.read())
+      except Exception:
+        pass
+      try:
+        if hasattr(self, 'falcon') and self.falcon:
+          regs["PFALCON_HWCFG2_FSP"] = hex(self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(self.falcon).read())
+      except Exception:
+        pass
+
+      print(f"🐧🔍 GSP/FSP Reg Dump: {regs}")
+    except Exception as e:
+      print(f"🐧🔍 Reg Dump Error: {e}")
 
   def kfsp_send_msg(self, nvmd:int, buf:bytes):
     # All single-packets go to seid 0
@@ -305,6 +391,10 @@ class NV_FLCN_COT(NV_IP):
     self.nvdev.NV_PFSP_EMEMC[0].write(offs=0, blk=0, aincw=0, aincr=1)
     self.nvdev.NV_PFSP_MSGQ_TAIL[0].write(self.nvdev.NV_PFSP_MSGQ_HEAD[0].read())
 
+    # Snapshot registers for debugging
+    self.dump_gsp_regs()
+
+@trace_methods
 class NV_GSP(NV_IP):
   def init_sw(self):
     self.handle_gen = itertools.count(0xcf000000)
@@ -326,7 +416,13 @@ class NV_GSP(NV_IP):
     # Alloc queues
     pte_cnt = ((queue_pte_cnt:=(queue_size * 2) // 0x1000)) + round_up(queue_pte_cnt * 8, 0x1000) // 0x1000
     pt_size = round_up(pte_cnt * 8, 0x1000)
-    queues_va, queues_sysmem = System.alloc_sysmem(pt_size + queue_size * 2, contiguous=False)
+    queues_va, queues_sysmem = System.alloc_sysmem(pt_size + queue_size * 2, contiguous=False, name="LIBOS_LOG_BUFFER_REGION")
+    if DEBUG >= 1:
+      print(f"MSGQ PT: pte_cnt={pte_cnt}, pt_size={pt_size}, total_pages={len(queues_sysmem)}")
+      for i in range(min(8, len(queues_sysmem))):
+        print(f"  PTE[{i}] = 0x{queues_sysmem[i]:x}")
+      if len(queues_sysmem) > 8:
+        print(f"  ... {len(queues_sysmem)-8} more PTEs")
 
     # Fill up ptes
     for i, sysmem in enumerate(queues_sysmem): to_mv(queues_va + i * 0x8, 0x8).cast('Q')[0] = sysmem
@@ -346,8 +442,8 @@ class NV_GSP(NV_IP):
     self.cmd_q = NVRpcQueue(self, self.cmd_q_va, None)
 
   def init_libos_args(self):
-    _, logbuf_sysmem = System.alloc_sysmem((2 << 20), contiguous=True)
-    libos_args_va, self.libos_args_sysmem = System.alloc_sysmem(0x1000, contiguous=True)
+    logbuf_va, logbuf_sysmem = System.alloc_sysmem((2 << 20), contiguous=True, name="LIBOS_LOG_BUFFER_REGION")
+    libos_args_va, self.libos_args_sysmem = System.alloc_sysmem(0x1000, contiguous=True, name="LIBOS_ARGS_BLOCK")
 
     libos_structs = (nv.LibosMemoryRegionInitArgument * 6).from_address(libos_args_va)
     for i, name in enumerate(["INIT", "INTR", "RM", "MNOC", "KRNL"]):
@@ -356,6 +452,10 @@ class NV_GSP(NV_IP):
 
     libos_structs[5] = nv.LibosMemoryRegionInitArgument(kind=nv.LIBOS_MEMORY_REGION_CONTIGUOUS, loc=nv.LIBOS_MEMORY_REGION_LOC_SYSMEM, size=0x1000,
         id8=int.from_bytes(bytes("RMARGS", 'utf-8'), 'big'), pa=self.rm_args_sysmem)
+
+    # Track mapped view for Linux log dumping (2MB buffer)
+    self.libos_log_sysmem = logbuf_sysmem
+    self.libos_log_mv = to_mv(logbuf_va, (2 << 20))
 
   def init_gsp_image(self):
     fw = fetch("https://github.com/NVIDIA/linux-firmware/raw/refs/heads/nvidia-staging/nvidia/ga102/gsp/gsp-570.144.bin", subdir="fw").read_bytes()
@@ -369,7 +469,7 @@ class NV_GSP(NV_IP):
     for i in range(3, 0, -1): npages[i-1] = ((npages[i] - 1) >> (nv.LIBOS_MEMORY_REGION_RADIX_PAGE_LOG2 - 3)) + 1
 
     offsets = [sum(npages[:i]) * 0x1000 for i in range(4)]
-    radix_va, self.gsp_radix3_sysmem = System.alloc_sysmem(offsets[-1] + len(self.gsp_image), contiguous=False)
+    radix_va, self.gsp_radix3_sysmem = System.alloc_sysmem(offsets[-1] + len(self.gsp_image), contiguous=False, name="GSP_RADIX3_IMAGE_AND_PT")
 
     # Copy image
     to_mv(radix_va + offsets[-1], len(self.gsp_image))[:] = self.gsp_image
@@ -380,12 +480,12 @@ class NV_GSP(NV_IP):
       to_mv(radix_va + offsets[i], npages[i+1] * 8).cast('Q')[:] = array.array('Q', self.gsp_radix3_sysmem[cur_offset:cur_offset+npages[i+1]])
 
     # Copy signature
-    self.gsp_signature_va, self.gsp_signature_sysmem = System.alloc_sysmem(len(signature), contiguous=True, data=signature)
+    self.gsp_signature_va, self.gsp_signature_sysmem = System.alloc_sysmem(len(signature), contiguous=True, data=signature, name="GSP_IMAGE_SIGNATURE")
 
   def init_boot_binary_image(self):
     self.booter_image = self.nvdev.extract_fw("kgspBinArchiveGspRmBoot", "ucode_image_prod_data")
     self.booter_desc = nv.RM_RISCV_UCODE_DESC.from_buffer_copy(self.nvdev.extract_fw("kgspBinArchiveGspRmBoot", "ucode_desc_prod_data"))
-    _, self.booter_sysmem = System.alloc_sysmem(len(self.booter_image), contiguous=True, data=self.booter_image)
+    _, self.booter_sysmem = System.alloc_sysmem(len(self.booter_image), contiguous=True, data=self.booter_image, name="GSP_BOOTER_IMAGE")
 
   def init_wpr_meta(self):
     self.init_gsp_image()
@@ -463,13 +563,25 @@ class NV_GSP(NV_IP):
     self.stat_q = NVRpcQueue(self, self.stat_q_va, self.cmd_q_va)
     self.cmd_q.rx = nv.msgqRxHeader.from_address(self.stat_q.va + self.stat_q.tx.rxHdrOff)
 
+    self.dump_gsp_regs()
+    if DEBUG:
+      print("--------------------------------")
+      print("GSP INIT DONE...")
+      print("--------------------------------")
     self.stat_q.wait_resp(nv.NV_VGPU_MSG_EVENT_GSP_INIT_DONE)
+
+    # Early reg snapshot after init done
+    self.dump_gsp_regs()
 
     self.nvdev.NV_PBUS_BAR1_BLOCK.write(mode=0, target=0, ptr=0)
     if self.nvdev.fmc_boot: self.nvdev.NV_VIRTUAL_FUNCTION_PRIV_FUNC_BAR1_BLOCK_LOW_ADDR.write(mode=0, target=0, ptr=0)
 
     self.priv_root = 0xc1e00004
     self.init_golden_image()
+
+    # Post-golden-image reg snapshot and LIBOS baseline dump
+    self.dump_gsp_regs()
+    self.dump_log_buffer()
 
   def fini_hw(self): self.rpc_unloading_guest_driver()
 
@@ -481,7 +593,7 @@ class NV_GSP(NV_IP):
       params.ramfcMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x200, addressSpace=2, cacheAttrib=0)
       params.instanceMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=ramfc_alloc.paddrs[0][0], size=0x1000, addressSpace=2, cacheAttrib=0)
 
-      method_va, method_sysmem = System.alloc_sysmem(0x5000, contiguous=True)
+      method_va, method_sysmem = System.alloc_sysmem(0x5000, contiguous=True, name="NV_METHOD_BUFFER")
       params.mthdbufMem = nv_gpu.NV_MEMORY_DESC_PARAMS(base=method_sysmem[0], size=0x5000, addressSpace=1, cacheAttrib=0)
 
       if client is not None and client != self.priv_root and params.hObjectError != 0:
@@ -534,7 +646,12 @@ class NV_GSP(NV_IP):
     self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER)
 
   def rpc_set_registry_table(self):
-    table = {'RMForcePcieConfigSave': 0x1, 'RMSecBusResetEnable': 0x1}
+    table = {
+      'RMForcePcieConfigSave': 0x1,
+      'RMSecBusResetEnable': 0x1,
+      # Spoof OS as Linux for firmware logic consistency with Linux runs
+      'gspOsType': 1,
+    }
     entries_bytes, data_bytes = bytes(), bytes()
     hdr_size, entries_size = ctypes.sizeof(nv.PACKED_REGISTRY_TABLE), ctypes.sizeof(nv.PACKED_REGISTRY_ENTRY) * len(table)
 
@@ -545,6 +662,368 @@ class NV_GSP(NV_IP):
 
     header = nv.PACKED_REGISTRY_TABLE(size=hdr_size + len(entries_bytes) + len(data_bytes), numEntries=len(table))
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_SET_REGISTRY, bytes(header) + entries_bytes + data_bytes)
+
+  def dump_gsp_regs(self):
+    """Dump GSP/FSP registers for debugging"""
+    try:
+      regs: dict[str, str] = {}
+
+      # GSP mailbox registers
+      try:
+        regs["MAILBOX0"] = hex(self.nvdev.NV_PGSP_FALCON_MAILBOX0.read())
+        regs["MAILBOX1"] = hex(self.nvdev.NV_PGSP_FALCON_MAILBOX1.read())
+      except Exception:
+        pass
+
+      # GSP queue registers
+      try:
+        regs["QUEUE_HEAD"] = hex(self.nvdev.NV_PGSP_QUEUE_HEAD[0].read())
+      except Exception:
+        pass
+      try:
+        regs["QUEUE_TAIL"] = hex(self.nvdev.NV_PGSP_QUEUE_TAIL[0].read())
+      except Exception:
+        pass
+
+      # PMC boot register
+      try:
+        regs["PMC_BOOT_0"] = hex(self.nvdev.NV_PMC_BOOT_0.read())
+      except Exception:
+        pass
+
+      # Falcon HWCFG2 at GSP base
+      try:
+        gsp_base = self.nvdev.flcn.falcon if hasattr(self.nvdev.flcn, 'falcon') else 0
+        if gsp_base:
+          regs["FALCON_HWCFG2"] = hex(self.nvdev.NV_PFALCON_FALCON_HWCFG2.with_base(gsp_base).read())
+      except Exception:
+        pass
+
+      print(f"🐧🔍 GSP Reg Dump: {regs}")
+    except Exception as e:
+      print(f"🐧🔍 Reg Dump Error: {e}")
+
+  def dump_log_buffer(self):
+    """Dump and decode LIBOS log buffer for Linux runs"""
+    try:
+      if not (hasattr(self, 'libos_log_sysmem') and hasattr(self, 'libos_log_mv')):
+        return
+
+      # Ensure CPU sees latest writes
+      try:
+        from tinygrad.runtime.autogen import libc
+        libc.msync(ctypes.c_void_p(mv_address(self.libos_log_mv)), ctypes.c_size_t(len(self.libos_log_mv)), libc.MS_SYNC)
+      except Exception:
+        pass
+
+      log_mv = self.libos_log_mv
+      log_data = log_mv[:0x10000].tobytes()
+
+      # First, dump as hex for analysis
+      print("\n📋 LibOS Log Buffer Hex Dump:")
+      print("=" * 80)
+
+      # Find the last non-zero byte to avoid dumping tons of zeros
+      last_nonzero = 0
+      for i in range(len(log_data) - 1, -1, -1):
+        if log_data[i] != 0:
+          last_nonzero = i
+          break
+
+      if last_nonzero > 0:
+        # Round up to next 16-byte boundary
+        dump_size = ((last_nonzero + 16) // 16) * 16
+        dump_size = min(dump_size, len(log_data))
+
+        print(f"Dumping 0x{dump_size:x} bytes (last non-zero at 0x{last_nonzero:x})")
+        print("Offset    00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F  |ASCII...........|")
+        print("-" * 80)
+
+        for offset in range(0, dump_size, 16):
+          # Hex part
+          hex_part = f"{offset:08x}  "
+          ascii_part = "|"
+
+          for j in range(16):
+            if offset + j < len(log_data):
+              byte = log_data[offset + j]
+              hex_part += f"{byte:02x} "
+              # ASCII representation
+              ascii_part += chr(byte) if 32 <= byte <= 126 else "."
+            else:
+              hex_part += "   "
+              ascii_part += " "
+
+            # Add extra space in the middle
+            if j == 7:
+              hex_part += " "
+
+          ascii_part += "|"
+          print(hex_part + " " + ascii_part)
+      else:
+        print("📋 LibOS Log Buffer is empty (all zeros)")
+
+      print("=" * 80)
+
+      # Decode LibOS ring buffer: scan backwards from put pointer for recent entries
+      print("\n📋 Extracting Recent LibOS Log Entries:")
+      print("-" * 80)
+
+      put_pointer = int.from_bytes(log_mv[0:8], 'little')
+      recent_messages = self._parse_libos_basic(log_mv.tobytes(), put_pointer)
+
+      if recent_messages:
+        print(f"📝 Found {len(recent_messages)} recent log entries (scanning backwards from put pointer):")
+        for i, msg in enumerate(recent_messages[:40]):  # Show up to 40 recent entries
+          # Highlight critical messages
+          msg_lower = msg.lower()
+          if any(keyword in msg_lower for keyword in ['error', 'fail', 'fatal', 'assert', 'panic']):
+            print(f"  🚨 [{i:3d}] {msg}")
+          elif any(keyword in msg_lower for keyword in ['init', 'sysmem', 'bar', 'dma', 'rpc']):
+            print(f"  ⚠️  [{i:3d}] {msg}")
+          else:
+            print(f"     [{i:3d}] {msg}")
+
+        if len(recent_messages) > 40:
+          print(f"     ... {len(recent_messages) - 40} more entries")
+      else:
+        print("  ⚠️  No readable recent log entries found")
+        print("  ℹ️  Ring buffer may be:")
+        print("     - Empty (GSP didn't log before failing)")  
+        print("     - Using compressed/binary format only")
+        print("     - Circular buffer wrapped multiple times")
+
+      # Also try the debug helper for verification
+      print(f"\n📋 Debug Helper Verification (raw metadata parsing):")
+      debug_entries = self._dump_meta_words_debug(log_mv.tobytes(), put_pointer//8, 10)
+      if debug_entries:
+        print(f"📝 Debug helper found {len(debug_entries)} valid entries:")
+        for entry in debug_entries:
+          print(f"     {entry}")
+      else:
+        print("📝 Debug helper found no valid entries")
+      
+      print("=" * 80)
+          
+    except Exception as e:
+      print(f"❌ Failed to dump LibOS logs: {e}")
+
+  def _dump_meta_words_debug(self, buf: bytes, start_idx: int, count: int = 10) -> list[str]:
+    """Debug helper to dump metadata words correctly (as provided by user)"""
+    import struct
+    messages = []
+    
+    try:
+      words = struct.unpack("<" + "Q"*(len(buf)//8), buf)
+      log_entries = len(words) - 1
+      slot = lambda x: 1 + (x % log_entries)
+      
+      # Use the ring put value as-is (element index), NOT bytes
+      i = start_idx  # should already be in element units
+      previous_put = max(0, i - log_entries)
+      
+      entries_found = 0
+      while entries_found < count:
+        # Adjust previous_put if put wrapped past our window
+        if previous_put + log_entries < i:
+            previous_put = i - log_entries
+
+        if i == previous_put:
+            break
+            
+        i -= 1
+        ts = words[slot(i)]
+        i -= 1
+        meta = words[slot(i)]
+        total_args = (meta >> 48) & 0xff
+        task_id    = (meta >> 56) & 0xff
+        arg_count  = total_args - 2
+        meta_va    = meta & ((1<<48)-1)
+        
+        # Accept only plausible v2 packed records
+        if 2 <= total_args <= 20 and 0 <= arg_count <= 18 and 1 <= task_id <= 9:
+          task_name = {
+            1: "LIBOS", 2: "GPU_SCHED", 3: "GSP_RM", 4: "SEC2", 
+            5: "NVDEC", 6: "NVENC", 7: "NVJPG", 8: "NVLINK", 9: "FSP"
+          }.get(task_id, f"T{task_id}")
+          
+          messages.append(f"[@{i:04x}] ts=0x{ts:016x} task={task_name}({task_id}) argc={arg_count} meta=0x{meta:016x} (va=0x{meta_va:012x})")
+          entries_found += 1
+          
+    except Exception as e:
+      messages.append(f"Debug helper failed: {e}")
+      
+    return messages
+
+  def _parse_libos_basic(self, log_data: bytes, put_pointer: int) -> list[str]:
+    """Basic LibOS parser using correct metadata format"""
+    import struct
+    messages = []
+    
+    try:
+      if len(log_data) % 8 != 0:
+        return ["Buffer not 64-bit aligned"]
+        
+      words = struct.unpack("<" + "Q" * (len(log_data) // 8), log_data)
+      log_entries = len(words) - 1
+      slot = lambda x: 1 + (x % log_entries)
+
+      # Convert put_pointer from bytes to words if needed
+      # The put_pointer at offset 0 is in bytes, we need words
+      i = put_pointer // 8  # Convert bytes to word index
+      previous_put = max(0, i - log_entries)  # decode full ring if you don't track prev
+
+      # Debug: show what we're working with
+      messages.append(f"Debug: put_pointer={put_pointer} (0x{put_pointer:x}), log_entries={log_entries}, buffer_words={len(words)}")
+      messages.append(f"Debug: Starting scan from i={i}, previous_put={previous_put}")
+      
+      # Show some raw words around the put_pointer area
+      if len(words) > 10:
+        start_word = max(0, min(i - 5, len(words) - 10))
+        messages.append(f"Debug: Raw words around put area (starting at word {start_word}):")
+        for j in range(10):
+          if start_word + j < len(words):
+            word_val = words[start_word + j]
+            messages.append(f"  word[{start_word + j:3d}] = 0x{word_val:016x}")
+      
+      # Check if put_pointer is reasonable
+      if i >= len(words):
+        messages.append(f"Debug: put_pointer {put_pointer} >= buffer words {len(words)}, using buffer end")
+        i = len(words) - 1
+      elif i <= 0:
+        messages.append(f"Debug: put_pointer {put_pointer} <= 0, using small value")
+        i = min(10, len(words) - 1)
+
+      entries_found = 0
+      scanned_count = 0
+      while entries_found < 10 and scanned_count < 20:  # Add scan limit to prevent infinite loops
+          # Adjust previous_put if put wrapped past our window (matches C logic)
+          if previous_put + log_entries < i:
+              previous_put = i - log_entries
+
+          if i == previous_put:
+              break
+
+          i -= 1
+          ts = words[slot(i)]
+          i -= 1
+          meta = words[slot(i)]
+
+          total_args = (meta >> 48) & 0xFF
+          task_id    = (meta >> 56) & 0xFF
+          arg_count  = total_args - 2
+          meta_va    = meta & ((1 << 48) - 1)
+
+          # Debug: show what we found regardless of validity
+          scanned_count += 1
+          messages.append(f"Debug scan #{scanned_count}: i={i}, ts=0x{ts:016x}, meta=0x{meta:016x}")
+          messages.append(f"  -> total_args={total_args}, task_id={task_id}, arg_count={arg_count}, meta_va=0x{meta_va:012x}")
+
+          # Accept only plausible v2 packed records
+          if 2 <= total_args <= 20 and 0 <= arg_count <= 18 and 1 <= task_id <= 9:
+              # Task name mapping from libos_log.h
+              task_names = {
+                1: "GSP_KERNEL", 2: "GSP_INIT", 3: "GSP_RM", 4: "GSP_INTR", 
+                5: "GSP_VGPU", 6: "GSP_MNOC", 7: "GSP_DEBUG", 8: "GSP_ROOT", 9: "GSP_MAX"
+              }
+              task_name = task_names.get(task_id, f"T{task_id}")
+              
+              messages.append(f"[@0x{i:04x}] ts=0x{ts:016x} task={task_name}({task_id}) argc={arg_count} meta=0x{meta:016x} (va=0x{meta_va:012x})")
+              entries_found += 1
+          else:
+              # Show why it was rejected
+              reasons = []
+              if not (2 <= total_args <= 20): reasons.append(f"total_args={total_args} not in [2,20]")
+              if not (0 <= arg_count <= 18): reasons.append(f"arg_count={arg_count} not in [0,18]")  
+              if not (1 <= task_id <= 9): reasons.append(f"task_id={task_id} not in [1,9]")
+              messages.append(f"  -> REJECTED: {'; '.join(reasons)}")
+              # likely unpacked metadata (older/flag not set) → cannot get arg_count without ELF; skip
+          
+    except Exception as e:
+      messages.append(f"Parser failed: {e}")
+    
+    if not messages or entries_found == 0:
+      # Try parsing as NOCAT/RATS format instead of LibOS v2
+      messages.append("No valid LibOS v2 records found - trying NOCAT/RATS format...")
+      nocat_messages = self._parse_nocat_format(log_data, put_pointer)
+      messages.extend(nocat_messages)
+    
+    return messages
+
+  def _parse_nocat_format(self, log_data: bytes, put_pointer: int) -> list[str]:
+    """Parse NOCAT/RATS log format based on actual buffer content"""
+    import struct
+    messages = []
+    
+    try:
+      # Convert to 64-bit words
+      words = struct.unpack("<" + "Q" * (len(log_data) // 8), log_data)
+      
+      messages.append(f"Parsing NOCAT format: {len(log_data)} bytes, {len(words)} words")
+      
+      # Look for the magic pattern 0x20003008 or 0x20003XXX in the words
+      magic_base = 0x20003000
+      magic_mask = 0xFFFFF000
+      
+      # Also look for known error codes
+      known_errors = {
+        0x019f59d0: "0x59 NV_ERR_OPERATING_SYSTEM related",
+        0x01a7cd82: "GSP error code",
+        0x01b30b62: "GSP error code",
+        0x019e31fa: "GSP error code",
+        0x0141f954: "GSP error code",
+        0x0141f782: "GSP error code",
+        0x01a7cd8e: "GSP error code",
+        0x013a4194: "GSP error code"
+      }
+      
+      entries_found = 0
+      max_entries = 30
+      
+      # Scan through words looking for patterns
+      for i in range(len(words) - 2):
+        if entries_found >= max_entries:
+          break
+          
+        word = words[i]
+        
+        # Check if this looks like a NOCAT entry marker (0x20003XXX pattern)
+        if (word & magic_mask) == magic_base:
+          # This could be a NOCAT entry
+          # Next word should be timestamp or error code
+          if i + 1 < len(words):
+            next_word = words[i + 1]
+            
+            # Check if next word is a timestamp (large value > 0x0000000100000000)
+            if next_word > 0x0000000100000000:
+              messages.append(f"NOCAT[{entries_found:2d}] word[{i:4d}]: marker=0x{word:016x}, timestamp=0x{next_word:016x}")
+              entries_found += 1
+            # Or check if previous word is a known error code
+            elif i > 0:
+              prev_word = words[i - 1]
+              if prev_word in known_errors:
+                messages.append(f"NOCAT[{entries_found:2d}] word[{i:4d}]: error=0x{prev_word:08x} ({known_errors[prev_word]}), marker=0x{word:016x}")
+                entries_found += 1
+              elif prev_word > 0 and prev_word < 0x10000000:
+                # Could be an unknown error code
+                messages.append(f"NOCAT[{entries_found:2d}] word[{i:4d}]: code=0x{prev_word:08x}, marker=0x{word:016x}")
+        
+        # Also check if this word itself is a known error
+        elif word in known_errors:
+          messages.append(f"Error[{entries_found:2d}] word[{i:4d}]: 0x{word:08x} = {known_errors[word]}")
+          entries_found += 1
+      
+      if entries_found == 0:
+        messages.append("No NOCAT patterns found - showing raw word dump instead:")
+        # Show some interesting words
+        for i in range(min(20, len(words))):
+          if words[i] != 0:
+            messages.append(f"  word[{i:3d}] = 0x{words[i]:016x}")
+        
+    except Exception as e:
+      messages.append(f"NOCAT parser failed: {e}")
+      
+    return messages
 
   def run_cpu_seq(self, seq_buf:memoryview):
     hdr = nv.rpc_run_cpu_sequencer_v17_00.from_address(mv_address(seq_buf))
